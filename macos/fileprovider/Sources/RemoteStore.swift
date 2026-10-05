@@ -67,6 +67,13 @@ final class RemoteStore {
     private var identifierByURI: [String: String] = [:]
     /// Explicitly pinned identifiers, persisted per drive.
     private var pinnedIdentifiers: Set<String> = []
+    private var pinRevision: UInt64 = 0
+    private var pinRevisionByIdentifier: [String: UInt64] = [:]
+
+    struct PinChange {
+        let wasPinned: Bool
+        let revision: UInt64
+    }
     /// Stable identities confirmed absent remotely. Finder may replay these
     /// as create callbacks after a domain is re-registered.
     private var deletedIdentityURIs: [String: String] = [:]
@@ -595,6 +602,7 @@ final class RemoteStore {
                 try await withManagerCall {
                     try await manager.requestDownloadForItem(withIdentifier: identifier)
                 }
+                if Task.isCancelled { return false }
                 if attempt == 1 {
                     try await materializePinnedContent(identifier, manager: manager)
                 }
@@ -635,13 +643,22 @@ final class RemoteStore {
             try await manager.getUserVisibleURL(for: identifier)
         }
         guard isEffectivelyPinned(identifier, uri: uri(for: identifier)) else { return }
-        try await Task.detached(priority: .utility) {
+        try Task.checkCancellation()
+        let coordinator = NSFileCoordinator()
+        let readTask = Task.detached(priority: .utility) {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             var error: NSError?
-            NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &error) { _ in }
+            coordinator.coordinate(readingItemAt: url, options: [], error: &error) { _ in }
             if let error { throw error }
-        }.value
+            try Task.checkCancellation()
+        }
+        try await withTaskCancellationHandler {
+            try await readTask.value
+        } onCancel: {
+            coordinator.cancel()
+            readTask.cancel()
+        }
     }
 
     private enum LocalContentState {
@@ -1203,14 +1220,46 @@ final class RemoteStore {
         }
     }
 
-    func setPinned(_ pinned: Bool, for identifier: NSFileProviderItemIdentifier) {
+    @discardableResult
+    func setPinned(_ pinned: Bool, for identifier: NSFileProviderItemIdentifier) -> PinChange {
         cacheLock.lock()
+        let previous = pinnedIdentifiers.contains(identifier.rawValue)
+        pinRevision &+= 1
+        pinRevisionByIdentifier[identifier.rawValue] = pinRevision
+        let change = PinChange(wasPinned: previous, revision: pinRevision)
         if pinned {
             pinnedIdentifiers.insert(identifier.rawValue)
         } else {
             pinnedIdentifiers.remove(identifier.rawValue)
         }
+        refreshCachedPinStatesLocked()
+        persistPins(pinnedIdentifiers.sorted())
+        cacheLock.unlock()
+        return change
+    }
 
+    /// Undo a cancelled or failed action only if a newer action has not
+    /// superseded its requested state.
+    func restorePin(_ change: PinChange, for identifier: NSFileProviderItemIdentifier) -> Bool {
+        cacheLock.lock()
+        guard pinRevisionByIdentifier[identifier.rawValue] == change.revision else {
+            cacheLock.unlock()
+            return false
+        }
+        pinRevision &+= 1
+        pinRevisionByIdentifier[identifier.rawValue] = pinRevision
+        if change.wasPinned {
+            pinnedIdentifiers.insert(identifier.rawValue)
+        } else {
+            pinnedIdentifiers.remove(identifier.rawValue)
+        }
+        refreshCachedPinStatesLocked()
+        persistPins(pinnedIdentifiers.sorted())
+        cacheLock.unlock()
+        return true
+    }
+
+    private func refreshCachedPinStatesLocked() {
         // Refresh descendants already cached by File Provider.
         for (rawIdentifier, cached) in cache {
             let cachedIdentifier = NSFileProviderItemIdentifier(rawIdentifier)
@@ -1227,9 +1276,9 @@ final class RemoteStore {
                     explicitlyPinned, effectivelyPinned: effectivelyPinned)
             }
         }
-        let snapshot = pinnedIdentifiers.sorted()
-        cacheLock.unlock()
+    }
 
+    private func persistPins(_ snapshot: [String]) {
         do {
             try FileManager.default.createDirectory(
                 at: pinnedFileURL.deletingLastPathComponent(),

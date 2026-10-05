@@ -1046,12 +1046,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
         // Update the desired state immediately so a newer opposite action can
         // stop an older download or eviction while it is still running.
+        var pinChanges: [(NSFileProviderItemIdentifier, RemoteStore.PinChange)] = []
         for identifier in itemIdentifiers {
             if !pin {
                 FileProviderDownloadSuppressionStore.begin(
                     driveID: store.drive.id, uri: store.uri(for: identifier))
             }
-            store.setPinned(pin, for: identifier)
+            pinChanges.append((identifier, store.setPinned(pin, for: identifier)))
         }
 
         let task = Task {
@@ -1076,6 +1077,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                             pin, for: identifier, item: item, store: store, manager: manager,
                             progress: itemProgresses[index])
                     }
+                    if Task.isCancelled || progress.isCancelled {
+                        firstError = CocoaError(.userCancelled)
+                        break
+                    }
                 } catch {
                     if !pin {
                         FileProviderDownloadSuppressionStore.end(
@@ -1084,7 +1089,24 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     logger.error(
                         "\(actionIdentifier.rawValue, privacy: .public) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
                     )
-                    firstError = firstError ?? error
+                    firstError = firstError ?? ((Task.isCancelled || progress.isCancelled)
+                        ? CocoaError(.userCancelled) : error)
+                    if pin { break }
+                }
+            }
+            if pin && firstError != nil {
+                let restored = pinChanges.compactMap { identifier, change in
+                    store.restorePin(change, for: identifier) ? identifier : nil
+                }
+                if !restored.isEmpty {
+                    store.recordPendingItemUpdates(uris: restored.compactMap {
+                        $0 == .rootContainer ? nil : store.uri(for: $0)
+                    })
+                    // The action task may already be cancelled; signal from a
+                    // fresh task so Finder still receives the restored policy.
+                    Task.detached(priority: .utility) {
+                        await store.signalWorkingSet()
+                    }
                 }
             }
             logger.notice(
@@ -1136,7 +1158,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
         var descendants: [FileProviderItem] = []
         if isFolder {
-            descendants = await listSubtree(of: identifier, store: store)
+            descendants = try await listSubtree(of: identifier, store: store)
         }
 
         let descendantFiles = descendants.filter {
@@ -1330,29 +1352,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
     private func listSubtree(
         of identifier: NSFileProviderItemIdentifier,
         store: RemoteStore
-    ) async -> [FileProviderItem] {
+    ) async throws -> [FileProviderItem] {
         var result: [FileProviderItem] = []
         var queue = [identifier]
         while !queue.isEmpty {
-            if Task.isCancelled { return result }
+            try Task.checkCancellation()
             let current = queue.removeFirst()
             var page: String? = nil
             repeat {
-                do {
-                    let (items, nextPage) = try await store.children(
-                        of: current, page: page)
-                    page = nextPage
-                    for child in items {
-                        result.append(child)
-                        if child.contentType.conforms(to: .folder) {
-                            queue.append(child.itemIdentifier)
-                        }
+                let (items, nextPage) = try await store.children(
+                    of: current, page: page)
+                page = nextPage
+                for child in items {
+                    result.append(child)
+                    if child.contentType.conforms(to: .folder) {
+                        queue.append(child.itemIdentifier)
                     }
-                } catch {
-                    logger.error(
-                        "listSubtree listing of \(current.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
-                    )
-                    page = nil
                 }
             } while page != nil
         }

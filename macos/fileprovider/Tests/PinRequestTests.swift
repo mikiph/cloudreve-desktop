@@ -50,6 +50,19 @@ enum PinRequestTests {
             from: Data(contentsOf: temporary.appendingPathComponent("pinned-test.json")))
         precondition(!persisted.contains(folder.rawValue))
         precondition(persisted.contains(child.rawValue))
+        // Cancelling a new Keep Downloaded action restores its prior state.
+        let cancelled = NSFileProviderItemIdentifier("cloudreve://my/Cancelled.txt")
+        let cancelledChange = store.setPinned(true, for: cancelled)
+        precondition(store.restorePin(cancelledChange, for: cancelled))
+        precondition(!store.isPinned(cancelled))
+        let supersededChange = store.setPinned(true, for: cancelled)
+        store.setPinned(true, for: cancelled) // A newer action must win.
+        precondition(!store.restorePin(supersededChange, for: cancelled))
+        precondition(store.isPinned(cancelled))
+        store.setPinned(false, for: cancelled)
+        let alreadyPinnedChange = store.setPinned(true, for: child)
+        precondition(store.restorePin(alreadyPinnedChange, for: child))
+        precondition(store.isPinned(child))
         // Exercise actual Finder replay, including folders never presented.
         try database.execute("INSERT INTO fp_event_heads VALUES('test',253,0,1)")
         try database.transaction {
