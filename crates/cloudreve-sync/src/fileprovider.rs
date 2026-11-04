@@ -334,6 +334,10 @@ pub struct FpEventRecord {
     pub to: String,
     #[serde(default)]
     pub local_echo: bool,
+    /// Stable Cloudreve file ID when the server supplied one. Lets the extension
+    /// tell a deleted item from a different item that now reuses its path.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub file_id: String,
 }
 
 
@@ -361,6 +365,7 @@ pub fn append_domain_events(
         from: event.from.clone(),
         to: event.to.clone(),
         local_echo: local_echo_paths.contains(&event.from) || (!event.to.is_empty() && local_echo_paths.contains(&event.to)),
+        file_id: event.file_id.clone(),
     }).collect::<Vec<_>>();
     crate::fileprovider_db::StateDb::open()?.append_events_consuming(drive_id, &mut records, receipts)
 }
@@ -390,7 +395,7 @@ pub fn append_metadata_name_events(drive_id: &str, names: &[String]) -> Result<(
 fn append_state_events(drive_id: &str, kind: &str, paths: &[String]) -> Result<()> {
     let mut records = paths.iter().map(|path| FpEventRecord {
         ts: 0, event_type: kind.into(), from: path.clone(),
-        to: String::new(), local_echo: false,
+        to: String::new(), local_echo: false, file_id: String::new(),
     }).collect::<Vec<_>>();
     crate::fileprovider_db::StateDb::open()?.append_events(drive_id, &mut records)
 }

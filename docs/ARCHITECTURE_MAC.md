@@ -579,3 +579,29 @@ across time gaps and interleaved activity. The newest outcome leads the single
 row, and earlier attempts remain in expandable history. Failed rows include their
 age so historical errors are not mistaken for active transfers. Transient network
 errors for regular files remain retryable. No errors are silently discarded.
+
+## Event verification, delete identity and replay speed
+
+Measured against a Cloudreve 4.19.1-pro server: a 1,000-file upload from another
+client reached the host as one SSE message with no loss, but the host then
+verified each create/modify path with a serial `/file/info` call (about 25 ms each)
+before Finder was signalled, and the extension replayed them serially again. Both
+now use bounded concurrency (8 in flight, results applied in order).
+
+- **Verification outcome.** A missing path (Cloudreve answers HTTP 200 with code
+  40016) is the trash-restore quirk and still records a rescan marker. A failed
+  lookup (offline, 5xx, rate limit) is retried three times, then the event is
+  journalled as received and a bounded presented-folder refresh is requested. It no
+  longer expires every sync anchor.
+- **Journal `file_id`.** Journal records carry the server's stable file ID (same
+  value as `/file/info` `id`, checked on 1,000 events). A replayed delete removes
+  the deleted file's own identity; if a newer file now holds the same path it is
+  left alone. Records written by older builds have no ID and keep path matching.
+- **Not changed.** The identity map is still persisted as one JSON file. Measured
+  cost is 6 ms at 5,000 identities and about 107 ms at 100,000; move it to SQLite
+  rows only if drives of that size appear.
+- **Open-source servers.** Community-edition source sends one SSE message per file
+  into a 16-slot buffer and drops on overflow. That was not reproducible on the Pro
+  server and is untested here. A periodic incremental search while connected would
+  be the mitigation if community servers must be supported.
+

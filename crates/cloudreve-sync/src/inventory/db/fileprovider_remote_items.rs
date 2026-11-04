@@ -118,6 +118,7 @@ impl InventoryDb {
                             from: item.uri,
                             to: String::new(),
                             local_echo: false,
+                            file_id: String::new(),
                         })
                         .collect::<Vec<_>>();
                 enqueue_events(tx, drive, &events)?;
@@ -210,7 +211,7 @@ mod tests {
         inventory.upsert_fileprovider_remote_items(&[row("changed", 1), row("unchanged", 1)]).unwrap();
         inventory.upsert_fileprovider_remote_items(&[other]).unwrap();
         let event = crate::fileprovider::FpEventRecord { ts: 0, event_type: "modify".into(),
-            from: "cloudreve://my/changed".into(), to: String::new(), local_echo: false };
+            from: "cloudreve://my/changed".into(), to: String::new(), local_echo: false, file_id: String::new() };
         inventory.upsert_fileprovider_remote_items_with_events(&[row("changed", 2)], &[event]).unwrap();
         let selected = inventory.fileprovider_remote_items_by_ids("drive", &["changed".into()]).unwrap();
         assert_eq!(selected.len(), 1);
@@ -253,6 +254,7 @@ mod tests {
             from: "/new".into(),
             to: String::new(),
             local_echo: false,
+                            file_id: String::new(),
         };
         {
             use diesel::connection::SimpleConnection;

@@ -23,6 +23,30 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 32;
 const EVENT_STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
+#[cfg(target_os = "macos")]
+const EVENT_VERIFY_CONCURRENCY: usize = 8;
+#[cfg(target_os = "macos")]
+const EVENT_VERIFY_ATTEMPTS: u32 = 3;
+
+/// Outcome of asking the server whether an event's path exists.
+#[cfg(target_os = "macos")]
+enum EventVerification {
+    Exists(cloudreve_api::models::explorer::FileResponse),
+    /// The server definitively answered that the path does not exist.
+    Gone,
+    /// The question could not be answered after retries.
+    Unverified,
+}
+
+/// Cloudreve answers a missing path with HTTP 200 and code 40016 (verified
+/// against a live 4.19 server); 404 is accepted for other deployments.
+#[cfg(target_os = "macos")]
+fn is_path_missing(error: &cloudreve_api::ApiError) -> bool {
+    matches!(
+        error,
+        cloudreve_api::ApiError::ApiError { code, .. } if *code == 40016 || *code == 404
+    )
+}
 
 struct BackoffState {
     retry_count: u32,
@@ -218,6 +242,32 @@ impl Mount {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    async fn verify_event_path(&self, uri: String) -> EventVerification {
+        let mut delay = Duration::from_millis(400);
+        for attempt in 1..=EVENT_VERIFY_ATTEMPTS {
+            let info = self
+                .cr_client
+                .get_file_info(&cloudreve_api::models::explorer::GetFileInfoService {
+                    uri: Some(uri.clone()),
+                    ..Default::default()
+                })
+                .await;
+            match info {
+                Ok(info) => return EventVerification::Exists(info),
+                Err(error) if is_path_missing(&error) => return EventVerification::Gone,
+                Err(error) => {
+                    tracing::debug!(target: "drive::remote_events", %error, attempt, "Could not verify event path");
+                    if attempt < EVENT_VERIFY_ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay *= 3;
+                    }
+                }
+            }
+        }
+        EventVerification::Unverified
+    }
+
     /// Refresh the File Provider after a remote event stream reconnects.
     #[cfg(target_os = "macos")]
     async fn record_rescan_marker(self: &Arc<Self>) {
@@ -255,51 +305,74 @@ impl Mount {
             let mut local_upload_echo_paths = HashSet::new();
             let mut upload_receipts = Vec::new();
             let mut needs_rescan = false;
-            for e in &events {
-                match e.event_type {
-                    FileEventType::Create | FileEventType::Modify => {
-                        let uri = format!("{}{}", remote_path, e.from);
-                        let info = self
-                            .cr_client
-                            .get_file_info(&cloudreve_api::models::explorer::GetFileInfoService {
-                                uri: Some(uri.clone()),
-                                ..Default::default()
-                            })
-                            .await;
-                        match info {
-                            Ok(info) => {
-                                let local_upload_echo = if info.file_type == file_type::FILE {
-                                    match crate::fileprovider::matching_upload_receipt(
-                                        &drive_id, &uri,
-                                    )? {
-                                        Some(receipt) => {
-                                            upload_receipts.push(receipt);
-                                            true
-                                        }
-                                        None => false,
-                                    }
-                                } else {
-                                    false
-                                };
-                                if local_upload_echo {
-                                    local_upload_echo_paths.insert(e.from.clone());
-                                } else if e.event_type == FileEventType::Modify
-                                    && info.file_type == file_type::FILE
-                                {
-                                    content_refresh_candidates
-                                        .push(format!("cloudreve-item:/{}", info.id));
+            let mut needs_presented_refresh = false;
+
+            // Verify create/modify events with bounded concurrency. A large
+            // upload from another device arrives as one batch; checking each
+            // path serially left Finder unsignalled for ~25 ms per file.
+            let verifications = {
+                use futures::StreamExt;
+                let jobs = events
+                    .iter()
+                    .map(|e| {
+                        (
+                            format!("{}{}", remote_path, e.from),
+                            matches!(e.event_type, FileEventType::Create | FileEventType::Modify),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                futures::stream::iter(jobs)
+                    .map(|(uri, checked)| async move {
+                        if checked { Some(self.verify_event_path(uri).await) } else { None }
+                    })
+                    .buffered(EVENT_VERIFY_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await
+            };
+            for (e, verification) in events.iter().zip(verifications) {
+                let uri = format!("{}{}", remote_path, e.from);
+                match verification {
+                    None => verified_events.push(e),
+                    Some(EventVerification::Exists(info)) => {
+                        let local_upload_echo = if info.file_type == file_type::FILE {
+                            match crate::fileprovider::matching_upload_receipt(&drive_id, &uri)? {
+                                Some(receipt) => {
+                                    upload_receipts.push(receipt);
+                                    true
                                 }
-                                verified_events.push(e);
+                                None => false,
                             }
-                            Err(_) => needs_rescan = true,
+                        } else {
+                            false
+                        };
+                        if local_upload_echo {
+                            local_upload_echo_paths.insert(e.from.clone());
+                        } else if e.event_type == FileEventType::Modify
+                            && info.file_type == file_type::FILE
+                        {
+                            content_refresh_candidates.push(format!("cloudreve-item:/{}", info.id));
                         }
+                        verified_events.push(e);
                     }
-                    _ => verified_events.push(e),
+                    // Trash restore reports a path that never existed. Only that
+                    // definite answer needs the full reconciliation.
+                    Some(EventVerification::Gone) => needs_rescan = true,
+                    // The server could not be asked (offline, 5xx, rate limit).
+                    // That says nothing about the path. Journal the event as
+                    // received, since the extension re-reads metadata itself, and
+                    // ask for the bounded folder refresh instead of expiring every
+                    // sync anchor.
+                    Some(EventVerification::Unverified) => {
+                        needs_presented_refresh = true;
+                        verified_events.push(e);
+                    }
                 }
             }
 
             if needs_rescan {
                 crate::fileprovider::append_rescan_marker(&drive_id)?;
+            } else if needs_presented_refresh {
+                crate::fileprovider::append_presented_refresh(&drive_id)?;
             }
             let events_to_log: Vec<FileEventData> =
                 verified_events.iter().map(|e| (*e).clone()).collect();
@@ -732,5 +805,29 @@ impl Mount {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    fn api_error(code: i32) -> cloudreve_api::ApiError {
+        cloudreve_api::ApiError::ApiError {
+            code, message: String::new(), error_detail: None,
+            correlation_id: None, aggregated_errors: None,
+        }
+    }
+
+    #[test]
+    fn only_a_definite_missing_path_is_gone() {
+        assert!(is_path_missing(&api_error(40016)));
+        assert!(is_path_missing(&api_error(404)));
+        // Rate limits, server faults, expired sessions and network errors say
+        // nothing about whether the path exists.
+        assert!(!is_path_missing(&api_error(50001)));
+        assert!(!is_path_missing(&api_error(429)));
+        assert!(!is_path_missing(&cloudreve_api::ApiError::AccessTokenExpired));
+        assert!(!is_path_missing(&cloudreve_api::ApiError::Other("timeout".into())));
     }
 }

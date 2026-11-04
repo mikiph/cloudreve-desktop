@@ -150,8 +150,11 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     return
                 }
                 var downloadedContentUpdates: [NSFileProviderItemIdentifier] = []
+                // A large remote batch names many items. Read their metadata with
+                // bounded concurrency instead of one round trip at a time.
+                let prefetched = await prefetchFileInfo(for: changes)
                 for change in changes {
-                    if let identifier = try await apply(change: change, to: observer) {
+                    if let identifier = try await apply(change: change, to: observer, prefetched: prefetched) {
                         if change.localEcho != true {
                             downloadedContentUpdates.append(identifier)
                         }
@@ -225,8 +228,54 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         return true
     }
 
+    private static let prefetchConcurrency = 8
+
+    typealias PrefetchedInfo = [String: Result<RemoteFile, Error>]
+
+    private func prefetchFileInfo(for changes: [RemoteStore.FpEvent]) async -> PrefetchedInfo {
+        var uris: [String] = []
+        var seen = Set<String>()
+        for change in changes {
+            let path: String?
+            switch change.type {
+            case "create", "modify", "metadata": path = change.from
+            case "rename": path = change.to
+            default: path = nil
+            }
+            guard let path else { continue }
+            let uri = store.uri(forEventPath: path)
+            if seen.insert(uri).inserted { uris.append(uri) }
+        }
+        guard uris.count > 1 else { return [:] }
+        let store = self.store
+        var results: PrefetchedInfo = [:]
+        await withTaskGroup(of: (String, Result<RemoteFile, Error>).self) { group in
+            var next = uris.makeIterator()
+            func start(_ uri: String) {
+                group.addTask {
+                    do { return (uri, .success(try await store.client.fileInfoWithShareState(uri: uri))) }
+                    catch { return (uri, .failure(error)) }
+                }
+            }
+            for _ in 0..<min(Self.prefetchConcurrency, uris.count) {
+                if let uri = next.next() { start(uri) }
+            }
+            while let (uri, result) = await group.next() {
+                results[uri] = result
+                if let uri = next.next() { start(uri) }
+            }
+        }
+        return results
+    }
+
+    private func fileInfo(_ uri: String, _ prefetched: PrefetchedInfo) async throws -> RemoteFile {
+        if let result = prefetched[uri] { return try result.get() }
+        return try await store.client.fileInfoWithShareState(uri: uri)
+    }
+
     private func apply(
-        change: RemoteStore.FpEvent, to observer: NSFileProviderChangeObserver
+        change: RemoteStore.FpEvent, to observer: NSFileProviderChangeObserver,
+        prefetched: PrefetchedInfo = [:]
     ) async throws -> NSFileProviderItemIdentifier? {
         if change.type == "refresh_presented" {
             try store.requestPresentedRefresh(sequence: change.ts)
@@ -259,7 +308,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         case "create", "modify", "metadata":
             // Refresh metadata; a disappeared item becomes a delete.
             do {
-                let file = try await store.client.fileInfoWithShareState(uri: fromURI)
+                let file = try await fileInfo(fromURI, prefetched)
                 let parents = try await store.parentItemsForUpdate(file)
                 if !parents.isEmpty { observer.didUpdate(parents) }
                 let discoverSubtree = file.isFolder && change.type != "metadata"
@@ -279,7 +328,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 observer.didDeleteItems(withIdentifiers: [identifier])
             }
         case "delete":
-            let identifier = store.identifier(forURI: fromURI)
+            let identifier = store.identifierForRemoteDelete(uri: fromURI, fileID: change.fileID)
             logger.notice(
                 "delivering remote delete for \(fromURI, privacy: .public) as \(identifier.rawValue, privacy: .public)"
             )
@@ -291,7 +340,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             if let to = change.to {
                 let toURI = store.uri(forEventPath: to)
                 do {
-                    let file = try await store.client.fileInfoWithShareState(uri: toURI)
+                    let file = try await fileInfo(toURI, prefetched)
                     let parents = try await store.parentItemsForUpdate(file)
                     if !parents.isEmpty { observer.didUpdate(parents) }
                     observer.didUpdate([

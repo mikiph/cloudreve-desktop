@@ -329,6 +329,7 @@ mod tests {
             from: "/Folder/你好 'quoted'.af".into(),
             to: String::new(),
             local_echo: false,
+            file_id: String::new(),
         }
     }
 

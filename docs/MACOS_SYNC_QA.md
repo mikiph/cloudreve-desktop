@@ -97,6 +97,7 @@ cargo test -p cloudreve-sync --lib fileprovider
 bash macos/scripts/test-state-database.sh
 bash macos/scripts/test-presented-refresh.sh
 bash macos/scripts/test-downloaded-refresh.sh
+bash macos/scripts/test-remote-delete-identity.sh
 FP_SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)" bash macos/scripts/test-pin-requests.sh
 FP_SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)" bash macos/scripts/test-file-provider-activity.sh
 FP_SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)" bash macos/scripts/test-reset-request.sh

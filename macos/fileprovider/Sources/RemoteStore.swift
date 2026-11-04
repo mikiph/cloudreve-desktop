@@ -126,11 +126,14 @@ final class RemoteStore {
         let to: String?
         let localEcho: Bool?
         var presentation: PresentedPage? = nil
+        /// Stable Cloudreve file ID from the server event, when it supplied one.
+        var fileID: String? = nil
 
         enum CodingKeys: String, CodingKey {
             case ts, type, from, to
             case localEcho = "local_echo"
             case presentation
+            case fileID = "file_id"
         }
     }
 
@@ -446,6 +449,21 @@ final class RemoteStore {
         }
 
         return NSFileProviderItemIdentifier(uri)
+    }
+
+    /// Identity a remote delete applies to. The event names the deleted file's
+    /// stable ID, but its path may already belong to a newer file (delete `a`,
+    /// then create a different `a`). Resolving by path alone would evict the
+    /// new file until the next refresh. When the path is held by a different
+    /// ID-based identity, only the deleted file's own identity is removed.
+    func identifierForRemoteDelete(uri: String, fileID: String?) -> NSFileProviderItemIdentifier {
+        let atPath = identifier(forURI: uri)
+        guard let fileID, !fileID.isEmpty else { return atPath }
+        let own = ItemIdentity.remoteID(fileID, fallbackURI: uri)
+        guard atPath.rawValue.hasPrefix(ItemIdentity.remotePrefix), atPath.rawValue != own else {
+            return atPath
+        }
+        return NSFileProviderItemIdentifier(own)
     }
 
     private func identifier(

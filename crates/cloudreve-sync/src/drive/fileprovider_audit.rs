@@ -302,6 +302,7 @@ impl Mount {
                         from: event.from,
                         to: event.to,
                         local_echo: false,
+                        file_id: event.file_id.clone(),
                     })
                     .collect::<Vec<_>>();
                 self.inventory
@@ -369,7 +370,7 @@ fn incremental_event(file: &FileResponse, old: Option<&FileProviderRemoteItem>) 
     Some(crate::fileprovider::FpEventRecord {
         ts: 0, event_type: kind.into(),
         from: if kind == "rename" { old.unwrap().uri.clone() } else { uri.clone() },
-        to: if kind == "rename" { uri } else { String::new() }, local_echo: false,
+        to: if kind == "rename" { uri } else { String::new() }, local_echo: false, file_id: file.id.clone(),
     })
 }
 
