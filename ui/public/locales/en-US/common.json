@@ -52,7 +52,6 @@
     "folderCheckCount_one": "{{completed}}/{{total}} folder",
     "changeCheckItems": "{{formattedCount}} items",
     "changeCheckItems_one": "{{formattedCount}} item",
-    "folderCheckScope": "Recent folders and newly discovered contents. The total can grow as folders are found.",
     "folderCheckRetrying": "Retrying {{count}} folders",
     "upToDate": "Your files are up to date.",
     "waiting": "Waiting...",

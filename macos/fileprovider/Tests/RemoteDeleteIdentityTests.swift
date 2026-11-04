@@ -36,6 +36,26 @@ import FileProvider
         let legacy = "cloudreve://my/legacy.txt"
         precondition(store.identifierForRemoteDelete(uri: legacy, fileID: "X") == store.identifier(forURI: legacy))
 
+        // Replay persists identities once per batch, not once per item.
+        let identityFile = root.appendingPathComponent("identities-\(drive.id).json")
+        func persisted() -> [String: String] {
+            guard let data = try? Data(contentsOf: identityFile) else { return [:] }
+            return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+        }
+        let before = persisted().count
+        _ = store.makeItem(file("S0", path: "cloudreve://my/single.txt"))
+        precondition(persisted().count == before + 1, "outside a batch every item is written immediately")
+        await store.batchingIdentityPersistence {
+            for i in 1...50 { _ = store.makeItem(file("B\(i)", path: "cloudreve://my/batch/\(i).txt")) }
+            precondition(persisted().count == before + 1, "nothing is written while the batch is open")
+            await store.batchingIdentityPersistence {  // nested batches flush only at the outermost close
+                _ = store.makeItem(file("N1", path: "cloudreve://my/batch/nested.txt"))
+            }
+            precondition(persisted().count == before + 1, "an inner batch must not flush")
+        }
+        precondition(persisted().count == before + 1 + 51, "the batch flushes once, with every identity")
+        precondition(persisted()["cloudreve-item:/B50"] == "cloudreve://my/batch/50.txt")
+
         // The journal carries the ID; older records without it still decode.
         let withID = try JSONDecoder().decode(RemoteStore.FpEvent.self,
             from: Data(#"{"ts":1,"type":"delete","from":"/a","to":"","file_id":"A"}"#.utf8))

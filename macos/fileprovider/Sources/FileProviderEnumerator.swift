@@ -153,10 +153,12 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 // A large remote batch names many items. Read their metadata with
                 // bounded concurrency instead of one round trip at a time.
                 let prefetched = await prefetchFileInfo(for: changes)
-                for change in changes {
-                    if let identifier = try await apply(change: change, to: observer, prefetched: prefetched) {
-                        if change.localEcho != true {
-                            downloadedContentUpdates.append(identifier)
+                try await store.batchingIdentityPersistence {
+                    for change in changes {
+                        if let identifier = try await apply(change: change, to: observer, prefetched: prefetched) {
+                            if change.localEcho != true {
+                                downloadedContentUpdates.append(identifier)
+                            }
                         }
                     }
                 }

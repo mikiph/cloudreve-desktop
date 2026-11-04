@@ -487,7 +487,6 @@ export default function Popup() {
                   {!!health.recovery.folder_progress?.retrying && <Box>
                     {t("popup.folderCheckRetrying", "Retrying {{count}} folders", { count: health.recovery.folder_progress.retrying })}
                   </Box>}
-                  <Box>{t("popup.folderCheckScope", "Recent folders and newly discovered contents. The total can grow as folders are found.")}</Box>
                 </Box>}
                 {health.recovery?.error && <Box>{health.recovery.error}</Box>}
               </Box>;
