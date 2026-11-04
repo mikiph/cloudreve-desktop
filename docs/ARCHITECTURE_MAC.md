@@ -586,7 +586,14 @@ Measured against a Cloudreve 4.19.1-pro server: a 1,000-file upload from another
 client reached the host as one SSE message with no loss, but the host then
 verified each create/modify path with a serial `/file/info` call (about 25 ms each)
 before Finder was signalled, and the extension replayed them serially again. Both
-now use bounded concurrency (8 in flight, results applied in order).
+now use bounded concurrency (8 in flight, results applied in order). The extension
+prefetches a replay page's metadata in waves of 8 unstructured `Task`s
+(`FileInfoPrefetch`). Do not change this to a `withTaskGroup` whose child result is
+`(String, Result<RemoteFile, Error>)`: with this toolchain's optimized build that
+crashed the extension with a pure-virtual call in task completion (reproduced by
+`test-file-info-prefetch.sh`, which must run optimized). After the fix a
+1,000-file burst took about 5 s to reach Finder's journal (was 26 s) and about 35 s
+to replay (was about 55 s); replay is now bounded by the 32-record page size.
 
 - **Verification outcome.** A missing path (Cloudreve answers HTTP 200 with code
   40016) is the trash-restore quirk and still records a rescan marker. A failed

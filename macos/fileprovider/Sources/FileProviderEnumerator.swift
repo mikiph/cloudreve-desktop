@@ -228,9 +228,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         return true
     }
 
-    private static let prefetchConcurrency = 8
-
-    typealias PrefetchedInfo = [String: Result<RemoteFile, Error>]
+    typealias PrefetchedInfo = FileInfoPrefetch.Results
 
     private func prefetchFileInfo(for changes: [RemoteStore.FpEvent]) async -> PrefetchedInfo {
         var uris: [String] = []
@@ -247,25 +245,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             if seen.insert(uri).inserted { uris.append(uri) }
         }
         guard uris.count > 1 else { return [:] }
-        let store = self.store
-        var results: PrefetchedInfo = [:]
-        await withTaskGroup(of: (String, Result<RemoteFile, Error>).self) { group in
-            var next = uris.makeIterator()
-            func start(_ uri: String) {
-                group.addTask {
-                    do { return (uri, .success(try await store.client.fileInfoWithShareState(uri: uri))) }
-                    catch { return (uri, .failure(error)) }
-                }
-            }
-            for _ in 0..<min(Self.prefetchConcurrency, uris.count) {
-                if let uri = next.next() { start(uri) }
-            }
-            while let (uri, result) = await group.next() {
-                results[uri] = result
-                if let uri = next.next() { start(uri) }
-            }
-        }
-        return results
+        return await FileInfoPrefetch.fetch(uris, using: store.client)
     }
 
     private func fileInfo(_ uri: String, _ prefetched: PrefetchedInfo) async throws -> RemoteFile {
