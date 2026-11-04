@@ -62,6 +62,8 @@ pub struct AppConfig {
     pub log_max_files: usize,
     /// Language/locale setting (e.g., "en-US", "zh-CN"). None means use system default.
     pub language: Option<String>,
+    /// None follows the operating system clock preference.
+    pub clock_hour12: Option<bool>,
 }
 
 impl Default for AppConfig {
@@ -75,6 +77,7 @@ impl Default for AppConfig {
             log_level: if cfg!(debug_assertions) { LogLevel::Debug } else { LogLevel::Info },
             log_max_files: 5,
             language: None,
+            clock_hour12: None,
         }
     }
 }
@@ -300,6 +303,10 @@ impl ConfigManager {
         })
     }
 
+    pub fn set_clock_hour12(&self, hour12: Option<bool>) -> Result<()> {
+        self.update(|config| config.clock_hour12 = hour12)
+    }
+
     /// Get the log directory path
     pub fn get_log_dir() -> PathBuf {
         dirs::home_dir()
@@ -314,6 +321,18 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn clock_preference_preserves_system_default_and_both_overrides() {
+        let legacy: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.clock_hour12, None);
+        for value in [None, Some(true), Some(false)] {
+            let config = AppConfig { clock_hour12: value, ..Default::default() };
+            let json = serde_json::to_string(&config).unwrap();
+            let restored: AppConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.clock_hour12, value);
+        }
+    }
 
     #[test]
     fn test_default_config() {

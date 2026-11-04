@@ -91,7 +91,9 @@ export default function DrivesSection() {
   }, []);
 
   useEffect(() => {
-    fetchDrives();
+    void fetchDrives();
+    const timer = setInterval(() => void fetchDrives(), 5000);
+    return () => clearInterval(timer);
   }, [fetchDrives]);
 
   const handleDelete = async (driveId: string, driveName: string) => {
@@ -106,7 +108,7 @@ export default function DrivesSection() {
       await invoke("remove_drive", { driveId });
       await fetchDrives();
     } catch (error) {
-      console.error("Failed to delete drive:", error);
+      setFileProviderNotice({ driveId, severity: "error", message: String(error) });
     }
   };
 
@@ -156,13 +158,14 @@ export default function DrivesSection() {
     setResettingDriveId(drive.id);
     setFileProviderNotice(null);
     try {
-      await invoke("reset_file_provider", {
+      const preservedPath = await invoke<string | null>("reset_file_provider", {
         driveId: drive.id,
       });
       setFileProviderNotice({
         driveId: drive.id,
         severity: "success",
-        message: t("settings.fileProviderResetSuccess"),
+        message: t("settings.fileProviderResetSuccess") + (preservedPath
+          ? " " + t("settings.finderRecoveredFiles", "Unsent edits were preserved at {{path}}. Review these files before deleting them.", { path: preservedPath }) : ""),
       });
       await fetchDrives();
     } catch (error) {
@@ -471,10 +474,32 @@ export default function DrivesSection() {
                   </SecondaryButton>
 
                   {drive.file_provider && (
+                    <SecondaryButton size="small" disabled={resettingDriveId !== null} onClick={async () => {
+                      setResettingDriveId(drive.id);
+                      try {
+                        await invoke("complete_finder_setup", { driveId: drive.id });
+                        await invoke("verify_finder_setup", { driveId: drive.id });
+                        setFileProviderNotice({ driveId: drive.id, severity: "success", message: t("settings.finderConnected", "Finder access is ready. Check recovery progress in the menu bar.") });
+                        await fetchDrives();
+                      } catch (error) { setFileProviderNotice({ driveId: drive.id, severity: "error", message: String(error) }); }
+                      finally { setResettingDriveId(null); }
+                    }}>{t("settings.connectFinder", "Set up Finder")}</SecondaryButton>
+                  )}
+                  {drive.file_provider && <SecondaryButton size="small" disabled={resettingDriveId !== null} onClick={async () => {
+                    const confirmed = await ask(t("settings.fullCheckConfirm", "This checks every folder for changes that may have been missed while Cloudreve was closed. It can take a while on large drives. Your downloads and Keep Downloaded selections are preserved."), {
+                      title: t("settings.fullCheck", "Full check"), kind: "info",
+                    });
+                    if (!confirmed) return;
+                    try {
+                      await invoke("full_check_finder", { driveId: drive.id });
+                      setFileProviderNotice({ driveId: drive.id, severity: "success", message: t("settings.fullCheckStarted", "Full check started. You can follow its status in the menu bar.") });
+                    } catch (error) { setFileProviderNotice({ driveId: drive.id, severity: "error", message: String(error) }); }
+                  }}>{t("settings.fullCheck", "Full check")}</SecondaryButton>}
+                  {drive.file_provider && (
                     <SecondaryButton
                       size="small"
                       startIcon={<SettingsBackupRestoreRounded />}
-                      disabled={resettingDriveId === drive.id}
+                      disabled={resettingDriveId !== null}
                       onClick={() => handleResetFileProvider(drive)}
                     >
                       {t("settings.fileProviderReset")}

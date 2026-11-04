@@ -139,6 +139,7 @@ pub struct AppState {
 /// Global cell to store the app state once initialization is complete
 static APP_STATE: OnceCell<AppState> = OnceCell::const_new();
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the sync service (DriveManager, shell services, etc.)
 async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
@@ -192,6 +193,60 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
     {
         let drives = drive_manager.list_drives().await;
         cloudreve_sync::fileprovider::sync_domains_with_drives(&drives).await;
+        // Reapply native state after failures and after wake. A successful
+        // registration must not make an offline drive appear connected.
+        let manager = drive_manager.clone();
+        spawn(async move {
+            let mut applied = std::collections::HashMap::new();
+            let mut tick = 0u64;
+            loop {
+                {
+                    let _operation = cloudreve_sync::fileprovider::DOMAIN_OPERATIONS.lock().await;
+                    if SHUTDOWN_STARTED.load(Ordering::Acquire) { break; }
+                    let drives = manager.list_drives().await;
+                    applied.retain(|id, _| drives.iter().any(|drive| &drive.id == id));
+                    for drive in drives.iter().filter(|drive| drive.enabled) {
+                        let Some(mount) = manager.get_drive(&drive.id).await else { continue; };
+                        let flags = mount.get_status_flags().await;
+                        let connected = flags.is_event_push_subscribed() && !flags.is_credential_expired();
+                        // macOS can suspend the extension between durable
+                        // refresh pages. Wake existing work without adding a
+                        // new marker or repeating the server search.
+                        if connected && applied.get(&drive.id) == Some(&true) {
+                            if let Err(error) = cloudreve_sync::fileprovider::wake_pending_refresh(&drive.id, &drive.name) {
+                                tracing::warn!(target: "fileprovider", %error, id=%drive.id, "Could not resume pending Finder checks");
+                            }
+                        }
+                        if applied.get(&drive.id) == Some(&connected) && tick % 10 != 0 { continue; }
+                        let reason = if flags.is_credential_expired() {
+                            "Cloudreve needs you to sign in again. Open Cloudreve Settings to reconnect."
+                        } else {
+                            "Cloudreve is reconnecting to the server. Check your internet connection. Syncing resumes automatically."
+                        };
+                        match cloudreve_sync::fileprovider::set_domain_connected(
+                            &cloudreve_sync::fileprovider::domain_identifier(&drive.id),
+                            &drive.name, connected, reason,
+                        ).await {
+                            Ok(()) => {
+                                if connected && applied.get(&drive.id) != Some(&true) {
+                                    // The SSE listener schedules recovery once per
+                                    // subscription. Native connection retries only
+                                    // wake the existing durable feed.
+                                    cloudreve_sync::fileprovider::signal_containers(
+                                        &cloudreve_sync::fileprovider::domain_identifier(&drive.id), &drive.name,
+                                        &[cloudreve_sync::fileprovider::WORKING_SET_CONTAINER.into(), cloudreve_sync::fileprovider::ROOT_CONTAINER.into()],
+                                    );
+                                }
+                                applied.insert(drive.id.clone(), connected);
+                            }
+                            Err(error) => tracing::warn!(target: "fileprovider", %error, id=%drive.id, connected, "Finder connection state will retry"),
+                        }
+                    }
+                }
+                tick += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
     }
 
     // Initialize and start the shell services (context menu handler) in a separate thread
@@ -312,6 +367,7 @@ async fn shutdown() {
         // Mark File Provider domains unavailable before shutdown.
         #[cfg(target_os = "macos")]
         {
+            let _operation = cloudreve_sync::fileprovider::DOMAIN_OPERATIONS.lock().await;
             let drives = state.drive_manager.list_drives().await;
             cloudreve_sync::fileprovider::set_domains_connected(&drives, false).await;
         }
@@ -329,6 +385,7 @@ async fn shutdown() {
         }
     }
 
+    SHUTDOWN_COMPLETE.store(true, Ordering::Release);
     tracing::info!(target: "main", "Shutdown complete");
 }
 
@@ -577,6 +634,16 @@ pub fn run() {
             commands::get_drives_info,
             #[cfg(target_os = "macos")]
             commands::reset_file_provider,
+            #[cfg(target_os = "macos")]
+            commands::complete_finder_setup,
+            #[cfg(target_os = "macos")]
+            commands::refresh_finder,
+            #[cfg(target_os = "macos")]
+            commands::full_check_finder,
+            #[cfg(target_os = "macos")]
+            commands::verify_finder_setup,
+            #[cfg(target_os = "macos")]
+            commands::open_finder_setup_settings,
             commands::get_file_icon,
             #[cfg(target_os = "macos")]
             commands::get_system_symbol,
@@ -600,6 +667,8 @@ pub fn run() {
             commands::set_notify_file_conflict,
             commands::set_fast_popup_launch,
             commands::get_general_settings,
+            commands::get_clock_preferences,
+            commands::set_clock_hour12,
             commands::set_log_to_file,
             commands::set_log_level,
             commands::set_log_max_files,
@@ -613,8 +682,14 @@ pub fn run() {
                 RunEvent::ExitRequested { api,code,.. } => {
                      if code.is_none() {
                         api.prevent_exit();
-                    } else {
-                        tracing::info!("exit code: {:?}", code);
+                    } else if !SHUTDOWN_COMPLETE.load(Ordering::Acquire) {
+                        api.prevent_exit();
+                        if SHUTDOWN_STARTED.load(Ordering::Acquire) { return; }
+                        let app = app_handle.clone();
+                        spawn(async move {
+                            shutdown().await;
+                            app.exit(code.unwrap_or(0));
+                        });
                     }
                     tracing::info!(target: "main", "Exit requested");
                 }

@@ -248,6 +248,7 @@ export default function TaskItem({
             {isFailed && task.error ? (
               <Typography variant="caption" color="error" component="span">
                 {activityLabel}: {task.error}
+                {" · "}<TimeAgo date={task.updated_at * 1000} formatter={timeAgoFormatter} />
               </Typography>
             ) : (
               <Typography variant="caption" color="text.secondary" component="span">

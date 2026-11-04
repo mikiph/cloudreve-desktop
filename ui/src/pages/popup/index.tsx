@@ -1,4 +1,6 @@
 import {
+  Alert,
+  Tooltip,
   Box,
   Button,
   ButtonGroup,
@@ -29,13 +31,18 @@ import { groupRecentTasks } from "./activity";
 import ConflictItem from "./ConflictItem";
 import FileProviderIssueItem from "./FileProviderIssueItem";
 import SavedItems from "./SavedItems";
+import { useClockPreferences } from "../../hooks/useClockPreferences";
+import { getRecoveryProgress } from "./recoveryProgress";
 
 export default function Popup() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const { formatTime } = useClockPreferences();
   const [summary, setSummary] = useState<StatusSummary | null>(null);
   const [fileProviderIssues, setFileProviderIssues] = useState<FileProviderIssue[]>([]);
   const [selectedDrive, setSelectedDrive] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [view, setView] = useState<"recent" | "pinned" | "shared">("recent");
   const isFetchingRef = useRef(false);
   const suppressBlurCloseUntilRef = useRef(0);
@@ -48,6 +55,7 @@ export default function Popup() {
   // right-click menu can temporarily move focus away from the webview; closing
   // immediately would destroy the popup before the user can choose a menu item.
   useEffect(() => {
+    if (isMacOS) return; // Native handler coordinates positioning and focus.
     let unlisten: () => void;
     const currentWindow = getCurrentWindow();
     const handleContextMenu = () => {
@@ -86,7 +94,7 @@ export default function Popup() {
         unlisten();
       }
     };
-  }, []);
+  }, [isMacOS]);
 
   // Fetch status summary
   const fetchSummary = useCallback(async () => {
@@ -169,6 +177,20 @@ export default function Popup() {
     }
   };
 
+  const selectedHealth = (summary?.sync_health ?? []).filter((health) => !selectedDrive || health.drive_id === selectedDrive);
+  const offline = selectedHealth.some((health) => !health.connected);
+  const recovering = selectedHealth.some((health) => health.recovery?.phase === "checking");
+  const applyingChanges = selectedHealth.some((health) => health.recovery?.phase === "applying");
+  const recoveryFailed = selectedHealth.some((health) => health.recovery?.phase === "retrying");
+  const recoveryProgress = getRecoveryProgress(selectedHealth);
+  const formatCount = (count: number) => count.toLocaleString(i18n.resolvedLanguage);
+  const recoveryCount = recoveryProgress?.kind === "folders"
+    ? t("popup.folderCheckCount", "{{completed}}/{{total}} folders", {
+        count: recoveryProgress.total, completed: formatCount(recoveryProgress.completed), total: formatCount(recoveryProgress.total),
+      })
+    : recoveryProgress?.kind === "items"
+      ? t("popup.changeCheckItems", "{{formattedCount}} items", { count: recoveryProgress.checked, formattedCount: formatCount(recoveryProgress.checked) })
+      : null;
   const hasActiveTasks =
     summary?.active_tasks && summary.active_tasks.length > 0;
   const hasFinishedTasks =
@@ -384,6 +406,8 @@ export default function Popup() {
         )}
       </Box>
 
+      {refreshError && <Alert severity="error" sx={{ mx: 2, mb: 1 }}>{refreshError}</Alert>}
+
       {/* Footer Status */}
       <Box
         sx={{
@@ -396,7 +420,7 @@ export default function Popup() {
           gap: 1,
         }}
       >
-        {hasActiveTasks ? (
+        {(hasActiveTasks || recovering || applyingChanges) && !offline ? (
           <RefreshIcon
             sx={{
               fontSize: 18,
@@ -408,24 +432,82 @@ export default function Popup() {
               },
             }}
           />
-        ) : hasAnyConflicts ? (
+        ) : (hasAnyConflicts || offline || recoveryFailed) ? (
           <FolderIcon sx={{ fontSize: 18, color: "warning.main" }} />
         ) : (
           <CheckCircleIcon
             sx={{ fontSize: 18, color: "success.main" }}
           />
         )}
-        <Typography variant="caption" color="text.secondary">
-          {hasActiveTasks
-            ? t("popup.syncingStatus", "Syncing {{count}} file(s)...", {
-                count: summary?.active_tasks.length ?? 0,
-              })
-            : hasAnyConflicts
-              ? t("popup.conflictStatus", "{{count}} conflict(s) need attention", {
-                  count: conflictCount,
+        <Box sx={{ flex: 1, minWidth: 0, display: "flex", alignItems: "baseline", gap: 1 }}>
+          <Typography variant="caption" color="text.secondary" sx={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {offline ? t("popup.reconnecting", "Disconnected — reconnecting to the server")
+              : recoveryFailed ? t("popup.recoveryRetryShort", "Recovery needs attention. Retrying")
+              : recovering ? t("popup.checkingChangesShort", "Checking for changes…")
+              : applyingChanges ? t("popup.updatingFinder", "Checking for changes…")
+              : hasActiveTasks
+              ? t("popup.syncingStatus", "Syncing {{count}} file(s)...", {
+                  count: summary?.active_tasks.length ?? 0,
                 })
-            : t("popup.upToDate", "Your files are up to date")}
-        </Typography>
+              : hasAnyConflicts
+                ? t("popup.conflictStatus", "{{count}} conflict(s) need attention", {
+                    count: conflictCount,
+                  })
+              : isMacOS ? t("popup.noPendingTransfers", "No pending transfers") : t("popup.upToDate", "Your files are up to date")}
+          </Typography>
+          {!offline && !recoveryFailed && recoveryCount && <Typography
+            component="span" variant="caption" color="text.secondary"
+            sx={{ flexShrink: 0, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}
+          >
+            {recoveryCount}
+          </Typography>}
+        </Box>
+        {isMacOS && !!summary?.drives.length && <Tooltip title={
+          <Box sx={{ whiteSpace: "pre-line" }}>
+            {t("popup.checkNow", "Check for changes")}
+            {selectedHealth.map((health) => {
+              const lastChecked = health.recovery?.last_completed_at;
+              const name = summary.drives.find((drive) => drive.id === health.drive_id)?.name ?? "";
+              return <Box key={health.drive_id}>
+                {name}: {lastChecked
+                  ? t("popup.lastChecked", "Last checked {{time}}", { time: `${new Date(lastChecked).toLocaleDateString()} ${formatTime(lastChecked)}` })
+                  : t("popup.notCheckedYet", "Not checked yet")}
+                {health.recovery?.phase === "checking" && health.recovery.folders_checked > 0 && <Box>
+                  {t("popup.fullCheckProgress", "Full check — {{items}} items in {{folders}} folders", {
+                    items: health.recovery.items_checked, folders: health.recovery.folders_checked,
+                  })}
+                </Box>}
+                {health.recovery?.phase === "applying" && <Box>
+                  {health.recovery.folder_progress && health.recovery.folder_progress.remaining > 0
+                    ? t("popup.folderCheckProgress", "{{items}} items checked · {{folders}} folders remaining", {
+                        items: health.recovery.folder_progress.items_checked,
+                        folders: health.recovery.folder_progress.remaining,
+                      })
+                    : t("popup.finderUpdatePending", "Finishing change check…")}
+                  {!!health.recovery.folder_progress?.retrying && <Box>
+                    {t("popup.folderCheckRetrying", "Retrying {{count}} folders", { count: health.recovery.folder_progress.retrying })}
+                  </Box>}
+                  <Box>{t("popup.folderCheckScope", "Recent folders and newly discovered contents. The total can grow as folders are found.")}</Box>
+                </Box>}
+                {health.recovery?.error && <Box>{health.recovery.error}</Box>}
+              </Box>;
+            })}
+          </Box>
+        }>
+          <span>
+            <IconButton size="small" aria-label={t("popup.checkNow", "Check for changes")}
+              disabled={refreshing || recovering || offline}
+              onClick={async () => {
+                setRefreshing(true);
+                setRefreshError(null);
+                try { await invoke("refresh_finder", { driveId: selectedDrive }); await fetchSummary(); }
+                catch (error) { setRefreshError(String(error)); }
+                finally { setRefreshing(false); }
+              }}>
+              <RefreshIcon fontSize="small" />
+            </IconButton>
+          </span>
+        </Tooltip>}
       </Box>
     </Box>
   );

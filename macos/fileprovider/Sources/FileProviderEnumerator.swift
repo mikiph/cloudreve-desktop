@@ -24,6 +24,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderEnumerationObserver,
         startingAt page: NSFileProviderPage
     ) {
+        store.resumePresentedRefresh()
         // Working-set enumeration includes cached items and pinned subtrees.
         if containerIdentifier == .workingSet {
             Task {
@@ -96,6 +97,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             do {
                 try await store.recoverMigrationStateIfNeeded()
                 store.applyPinRequests()
+                store.resumePresentedRefresh()
                 if containerIdentifier != .workingSet,
                     containerIdentifier != .trashContainer,
                     consumePresentedContainerRefresh()
@@ -144,6 +146,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     }
                     observer.finishEnumeratingChanges(
                         upTo: reconciliationAnchor, moreComing: false)
+                    store.recordAppliedAnchor(reconciliationAnchor)
                     return
                 }
                 var downloadedContentUpdates: [NSFileProviderItemIdentifier] = []
@@ -199,9 +202,8 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     }
                 }
                 observer.finishEnumeratingChanges(upTo: newAnchor, moreComing: moreComing)
-                if !downloadedContentUpdates.isEmpty {
-                    await store.refreshDownloadedContent(downloadedContentUpdates)
-                }
+                if containerIdentifier == .workingSet { store.recordAppliedAnchor(newAnchor) }
+                store.scheduleDownloadedContentRefresh(downloadedContentUpdates)
             } catch let error as NSFileProviderError where error.code == .syncAnchorExpired {
                 logger.info(
                     "anchor expired for \(self.containerIdentifier.rawValue, privacy: .public); system will re-enumerate"
@@ -226,6 +228,16 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     private func apply(
         change: RemoteStore.FpEvent, to observer: NSFileProviderChangeObserver
     ) async throws -> NSFileProviderItemIdentifier? {
+        if change.type == "refresh_presented" {
+            try store.requestPresentedRefresh(sequence: change.ts)
+            return nil
+        }
+        if change.type == "presented_page", let page = change.presentation {
+            let result = store.applyPresentedPage(page)
+            if !result.items.isEmpty { observer.didUpdate(result.items) }
+            if !result.deleted.isEmpty { observer.didDeleteItems(withIdentifiers: result.deleted) }
+            return nil
+        }
         if change.type == "metadata_rescan" {
             let items = await store.refreshPresentedShareMetadata()
             if !items.isEmpty {
@@ -250,14 +262,12 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 let file = try await store.client.fileInfoWithShareState(uri: fromURI)
                 let parents = try await store.parentItemsForUpdate(file)
                 if !parents.isEmpty { observer.didUpdate(parents) }
+                let discoverSubtree = file.isFolder && change.type != "metadata"
+                    && (change.type == "create" || store.needsSubtreeRefresh(file))
                 let item = store.makeItem(file)
-                var refreshContent = false
-                if containerIdentifier == .workingSet && change.type == "modify"
-                    && !file.isFolder
-                {
-                    refreshContent = await store.prepareDownloadedContentForRemoteUpdate(
-                        item.itemIdentifier)
-                }
+                if discoverSubtree { try store.requestSubtreeRefresh(file) }
+                let refreshContent = containerIdentifier == .workingSet
+                    && change.type == "modify" && !file.isFolder && change.localEcho != true
                 logger.notice(
                     "refreshed \(fromURI, privacy: .public), shared: \(file.shared == true, privacy: .public)"
                 )
@@ -287,6 +297,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     observer.didUpdate([
                         store.makeItem(file, preservingIdentifier: identifier)
                     ])
+                    try store.requestSubtreeRefresh(file)
                 } catch CloudreveError.noSuchItem {
                     store.evictCachedItems(withIdentifiers: [identifier])
                     observer.didDeleteItems(withIdentifiers: [identifier])
@@ -312,14 +323,18 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             return NSFileProviderError(.notAuthenticated)
         case CloudreveError.nameCollision:
             return NSFileProviderError(.filenameCollision)
-        case CloudreveError.lockConflict(_, _, _):
+        case CloudreveError.lockConflict(_, let application, _):
             return NSError(
                 domain: NSFileProviderErrorDomain,
                 code: NSFileProviderError.Code.cannotSynchronize.rawValue,
                 userInfo: [
                     NSLocalizedDescriptionKey:
-                        "Someone has this file open online."
+                        application == "upload" ? "An unfinished upload is holding this item." : "Someone has this file open online."
                 ])
+        case CloudreveError.unsupportedPackage:
+            return NSError(domain: NSFileProviderErrorDomain,
+                code: NSFileProviderError.Code.cannotSynchronize.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: error.localizedDescription])
         case CloudreveError.staleVersion:
             return NSError(
                 domain: NSFileProviderErrorDomain,

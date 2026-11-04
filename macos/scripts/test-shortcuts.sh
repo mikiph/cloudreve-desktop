@@ -15,6 +15,7 @@ swiftc -swift-version 5 \
     -o "$TEST_BINARY" \
     "$ROOT/macos/fileprovider/Sources/ShortcutResolver.swift" \
     "$ROOT/macos/fileprovider/Sources/CloudreveClient.swift" \
+    "$ROOT/macos/fileprovider/Sources/FileProviderStateDatabase.swift" \
     "$ROOT/macos/fileprovider/Sources/UploadEncryption.swift" \
     "$ROOT/macos/fileprovider/Tests/ShortcutTests.swift"
 

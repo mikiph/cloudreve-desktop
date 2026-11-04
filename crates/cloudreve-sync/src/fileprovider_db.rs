@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 const SCHEMA: &str = include_str!("../../../macos/fileprovider/state-schema.sql");
 const EVENT_RETENTION: i64 = 100_000;
+const RESCAN_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_fp_events_rescan ON fp_events(drive,sequence) WHERE CASE WHEN json_valid(payload) THEN json_extract(payload,'$.type') END='rescan';";
 
 #[derive(QueryableByName)]
 struct Number {
@@ -123,6 +124,9 @@ impl StateDb {
             if version != 1 {
                 bail!("Unsupported File Provider state schema {version}");
             }
+            // Additive upgrade for version-1 databases. Swift uses this index
+            // to find anchor resets without loading a large metadata backlog.
+            tx.batch_execute(RESCAN_INDEX)?;
             Ok(())
         })?;
         Ok(Self {
@@ -208,6 +212,16 @@ impl StateDb {
                     .execute(tx)?;
                 Ok(payload)
             })
+    }
+
+    /// The last durable event a completed server check needs Finder to consume.
+    pub fn latest_event_sequence(&mut self, drive: &str) -> Result<i64> {
+        Ok(diesel::sql_query(
+            "SELECT COALESCE((SELECT latest FROM fp_event_heads WHERE drive=?),0) AS value",
+        )
+        .bind::<Text, _>(drive)
+        .get_result::<Number>(&mut self.connection)?
+        .value)
     }
 
     pub fn append_events(&mut self, drive: &str, records: &mut [FpEventRecord]) -> Result<()> {
@@ -366,6 +380,21 @@ mod tests {
             .get_result::<Number>(&mut db.connection)
             .unwrap()
             .value
+    }
+
+    #[test]
+    fn recovery_target_tracks_committed_events_per_drive_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = StateDb::at(temp.path()).unwrap();
+        assert_eq!(db.latest_event_sequence("drive").unwrap(), 0);
+        let mut events = [event(), event()];
+        db.append_events("drive", &mut events).unwrap();
+        let target = events[1].ts;
+        assert_eq!(db.latest_event_sequence("drive").unwrap(), target);
+        assert_eq!(db.latest_event_sequence("another-drive").unwrap(), 0);
+        drop(db);
+        let mut db = StateDb::at(temp.path()).unwrap();
+        assert_eq!(db.latest_event_sequence("drive").unwrap(), target);
     }
 
     #[test]

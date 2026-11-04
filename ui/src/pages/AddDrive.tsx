@@ -1,6 +1,6 @@
 import { Alert, Box, Button, CircularProgress, Container, IconButton, InputAdornment, Snackbar, Typography } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
-import { openUrl, openPath } from "@tauri-apps/plugin-opener";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { invoke } from '@tauri-apps/api/core';
 import confetti from "canvas-confetti";
@@ -20,10 +20,9 @@ import {
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { platform } from '@tauri-apps/plugin-os';
-import { homeDir } from '@tauri-apps/api/path';
 import { CALLBACK_PATH, CLIENT_ID, SCOPES } from "../utils/constants";
 
-type PageState = "url_input" | "waiting" | "final_setup" | "setting_up" | "success";
+type PageState = "url_input" | "waiting" | "final_setup" | "setting_up" | "finder_setup" | "success";
 
 interface OAuthCallbackData {
   code: string;
@@ -96,6 +95,10 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const [siteUrl, setSiteUrl] = useState(isReauthorize ? decodedSiteUrl : "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [savedDriveId, setSavedDriveId] = useState<string | null>(null);
+  const [finderPath, setFinderPath] = useState<string | null>(null);
+  const [finderBusy, setFinderBusy] = useState(false);
+  const finderCheckInFlight = useRef(false);
   const [snackbarOpen, setSnackbarOpen] = useState(false);
   const [logo, setLogo] = useState(defaultLogo);
   const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
@@ -340,7 +343,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
     const cleanSiteUrl = new URL(pkceSessionRef.current!.siteUrl).origin;
 
     try {
-      await invoke('add_drive', {
+      const savedId = await invoke<string>('add_drive', {
         config: {
           site_url: cleanSiteUrl,
           access_token: tokens.access_token,
@@ -354,8 +357,13 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
           drive_id: isReauthorize ? driveId : undefined,
         }
       });
-      // Success - switch to success state
-      setPageState("success");
+      setSavedDriveId(savedId);
+      if (isMacOS) {
+        setPageState("finder_setup");
+        await connectFinder(savedId);
+      } else {
+        setPageState("success");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setError(t("addDrive.errors.addDriveFailed", { message }));
@@ -364,12 +372,44 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
     }
   }
 
+  const connectFinder = async (id: string) => {
+    setFinderBusy(true);
+    setError("");
+    try {
+      const path = await invoke<string>("complete_finder_setup", { driveId: id, driveName });
+      setFinderPath(path);
+      setPageState("finder_setup");
+    } catch (error) {
+      setError(String(error));
+      setPageState("finder_setup");
+    } finally { setFinderBusy(false); }
+  };
+
+  // Resume automatically after the user approves the native Finder/TCC UI.
+  // Only one check may await a system dialog at a time.
+  useEffect(() => {
+    if (pageState !== "finder_setup" || !savedDriveId || !finderPath || finderBusy) return;
+    let cancelled = false;
+    const verify = async () => {
+      if (finderCheckInFlight.current) return;
+      finderCheckInFlight.current = true;
+      try {
+        await invoke("verify_finder_setup", { driveId: savedDriveId });
+        if (!cancelled) { setError(""); setPageState("success"); }
+      } catch (error) {
+        if (!cancelled) setError(String(error));
+      } finally { finderCheckInFlight.current = false; }
+    };
+    void verify();
+    const timer = setInterval(() => void verify(), 3000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [pageState, savedDriveId, finderPath, finderBusy]);
+
   const handleOpenDriveAndClose = async () => {
     try {
       if (isMacOS) {
-        // On macOS the drive lives in Finder's CloudStorage locations.
-        const home = await homeDir();
-        await openPath(`${home}/Library/CloudStorage`);
+        if (!finderPath) throw new Error("Finder location is not ready yet");
+        await invoke("show_file_in_explorer", { path: finderPath });
       } else {
         // The opener plugin is intentionally scoped to $HOME, while Windows
         // sync roots can live on any drive (for example E:\\Cloudreve). Use
@@ -377,12 +417,11 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
         await invoke("show_file_in_explorer", { path: localPath });
       }
     } catch (openError) {
-      console.error("Failed to open drive folder:", openError);
-    } finally {
-      // This is a one-shot setup window. Destroy it even when Explorer could
-      // not be opened so the success screen can never trap the user.
-      await getCurrentWindow().destroy();
+      setError(String(openError));
+      setSnackbarOpen(true);
+      return;
     }
+    await getCurrentWindow().destroy();
   }
 
   return (
@@ -391,13 +430,14 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
       sx={{
         bgcolor: "background.default",
         color: "text.primary",
-        minHeight: "100vh",
+        height: "100vh",
+        overflowY: "auto",
         position: "relative",
       }}
     >
       <Box
         sx={{
-          minHeight: "100vh",
+          minHeight: "100%",
           display: "flex",
           flexDirection: "column",
           justifyContent: "center",
@@ -445,7 +485,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             borderRadius: 3,
           }}
         >
-          {pageState !== "setting_up" && pageState !== "success" && <Box
+          {pageState !== "setting_up" && pageState !== "success" && pageState !== "finder_setup" && <Box
             component="img"
             src={logo}
             alt="Cloudreve"
@@ -475,6 +515,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                 {isReauthorize ? t("addDrive.reauthorizeSuccessTitle") : t("addDrive.successTitle")}
               </Typography>
 
+              {isMacOS && <Typography variant="body2" color="text.secondary" textAlign="center">
+                {t("addDrive.finderReady", "Your Finder location is ready. Cloudreve is checking for changes. Follow progress in the menu bar. Use Keep Downloaded in Finder for files you need offline.")}
+              </Typography>}
               <Box
                 sx={{
                   width: "100%",
@@ -504,6 +547,33 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                   </Button>
                 )}
               </Box>
+            </>
+          ) : pageState === "finder_setup" ? (
+            <>
+              <Typography variant="h5" component="h1">{t("addDrive.finderTitle", "Connect Finder")}</Typography>
+              <Typography variant="body2" color="text.secondary" textAlign="center">
+                {t("addDrive.finderDescription", "Your account is saved. Finder opens your new drive automatically. Choose Allow or Enable if macOS asks. We’ll check access and finish setup as soon as approval is complete.")}
+              </Typography>
+              {error && <Alert severity="warning" sx={{ width: "100%", boxSizing: "border-box" }}>{error}</Alert>}
+              {!finderPath && error && <FilledTextField fullWidth label={t("addDrive.localDriveName")} value={driveName}
+                disabled={finderBusy} onChange={(event) => setDriveName(event.target.value)} />}
+              <Button fullWidth variant="contained" loading={finderBusy} disabled={!savedDriveId || !driveName.trim()}
+                onClick={() => savedDriveId && connectFinder(savedDriveId)}>
+                {finderPath ? t("addDrive.openFinderAgain", "Open Finder again") : t("addDrive.retryFinder", "Connect Finder / Retry")}
+              </Button>
+              {finderPath && <Typography variant="body2" color="text.secondary">
+                {t("addDrive.waitingApproval", "Waiting for Finder approval and file access… You can return here after approving the native prompt.")}
+              </Typography>}
+              <Button onClick={async () => {
+                try { await invoke("open_finder_setup_settings"); }
+                catch (error) { setError(String(error)); }
+              }}>{t("addDrive.openSystemSettings", "Open System Settings")}</Button>
+              {error && <Typography variant="caption" color="text.secondary">
+                {t("addDrive.permissionsHelp", "If needed: General → Login Items & Extensions → File Providers enables Cloudreve. Privacy & Security → Files and Folders controls file access. Full Disk Access and Accessibility are not required for this setup.")}
+              </Typography>}
+              <Button onClick={() => getCurrentWindow().destroy()} disabled={finderBusy}>
+                {t("addDrive.finishLater", "Finish later in Settings")}
+              </Button>
             </>
           ) : pageState === "setting_up" ? (
             // Setting up state - loading indicator
@@ -536,7 +606,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                 color="text.secondary"
                 textAlign="center"
               >
-                {isReauthorize ? t("addDrive.reauthorizeDescription") : t("addDrive.finalSetupDescription")}
+                {isReauthorize ? t("addDrive.reauthorizeDescription") : isMacOS
+                  ? t("addDrive.finderNameDescription", "Choose a name for your drive in Finder. Next, macOS will ask for any access it needs.")
+                  : t("addDrive.finalSetupDescription")}
               </Typography>
 
               <Box
@@ -595,7 +667,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                       <Alert severity="info" sx={{ mt: -1 }}>
                         {t(
                           "addDrive.folderNotEmptyWillSync",
-                          "This folder already has files. Existing local content will be merged into the remote drive; same-name files with matching hashes will be treated as already synced."
+                          "This folder already has files. Existing local content will be merged into the remote drive. Same-name files with matching hashes will be treated as already synced."
                         )}
                       </Alert>
                     )}

@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS fp_events (
     payload TEXT NOT NULL,
     PRIMARY KEY (drive, sequence)
 );
+CREATE INDEX IF NOT EXISTS idx_fp_events_rescan ON fp_events(drive,sequence)
+    WHERE CASE WHEN json_valid(payload) THEN json_extract(payload,'$.type') END='rescan';
 CREATE TABLE IF NOT EXISTS fp_records (
     namespace TEXT NOT NULL,
     key TEXT NOT NULL,

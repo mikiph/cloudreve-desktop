@@ -1,4 +1,5 @@
 import {
+  Alert,
   Box,
   Typography,
   Switch,
@@ -11,6 +12,7 @@ import {
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { useClockPreferences } from "../../hooks/useClockPreferences";
 import { languages } from "../../i18n";
 
 interface SettingItemProps {
@@ -101,6 +103,7 @@ function SettingSelectItem({
         <FormControl size="small" sx={{ minWidth: 100 }}>
           <Select
             value={value}
+            inputProps={{ "aria-label": title }}
             onChange={(e) => onChange(e.target.value)}
             disabled={disabled}
             size="small"
@@ -230,6 +233,9 @@ const MAX_FILES_OPTIONS = [
 
 export default function GeneralSection() {
   const { t, i18n } = useTranslation();
+  const { preferences, setPreferences } = useClockPreferences();
+  const [clockError, setClockError] = useState<string | null>(null);
+  const [clockSaving, setClockSaving] = useState(false);
   const [autoStart, setAutoStart] = useState(true);
   const [notifyCredentialExpired, setNotifyCredentialExpired] = useState(true);
   const [notifyFileConflict, setNotifyFileConflict] = useState(true);
@@ -411,6 +417,31 @@ export default function GeneralSection() {
           onChange={handleLanguageChange}
           disabled={loading}
           isLast={true}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title={t("settings.timeSettings", "Time")}>
+        {clockError && <Alert severity="error">{clockError}</Alert>}
+        <SettingSelectItem
+          title={t("settings.clockFormat", "Clock format")}
+          value={preferences.hour12 === null ? "system" : preferences.hour12 ? "12h" : "24h"}
+          options={[
+            { value: "system", label: t("settings.clockSystem", "System default") },
+            { value: "12h", label: t("settings.clock12", "12-hour") },
+            { value: "24h", label: t("settings.clock24", "24-hour") },
+          ]}
+          onChange={async (value) => {
+            const hour12 = value === "system" ? null : value === "12h";
+            setClockSaving(true);
+            setClockError(null);
+            try {
+              await invoke("set_clock_hour12", { hour12 });
+              setPreferences((previous) => ({ ...previous, hour12 }));
+            } catch (error) { setClockError(String(error)); }
+            finally { setClockSaving(false); }
+          }}
+          disabled={loading || clockSaving}
+          isLast
         />
       </SettingsGroup>
 

@@ -108,10 +108,11 @@ impl Mount {
             (config.remote_path.clone(), config.sync_path.clone())
         };
 
-        // macOS: subscribe with a fresh client ID per attempt. The server keeps
-        // one event channel per client ID, and reusing an ID can attach to a
-        // dead channel ("resumed") that never delivers live events. Gaps from
-        // downtime are covered by the rescan marker written on subscribe.
+        // macOS: a fresh ID avoids sharing the previous handler's subscription
+        // state during overlapping reconnects. A delayed old handler can mark a
+        // reused subscriber offline while the new connection still heartbeats.
+        // This forgoes best-effort replay, so subscribe always schedules recovery.
+        // Neither SSE replay nor timestamp searches prove complete continuity.
         #[cfg(target_os = "macos")]
         let subscription = self
             .cr_client
@@ -179,7 +180,7 @@ impl Mount {
                     FileEvent::Subscribed => {
                         was_connected = true;
                         self.set_event_push_subscribed(true).await;
-                        tracing::info!(target: "drive::remote_events", "New subscribtion, triggger full sync...");
+                        tracing::info!(target: "drive::remote_events", "New subscription established, scheduling recovery");
                         #[cfg(target_os = "macos")]
                         {
                             self.record_rescan_marker().await;
@@ -220,25 +221,8 @@ impl Mount {
     /// Refresh the File Provider after a remote event stream reconnects.
     #[cfg(target_os = "macos")]
     async fn record_rescan_marker(self: &Arc<Self>) {
-        let (drive_id, drive_name) = {
-            let config = self.config.read().await;
-            (config.id.clone(), config.name.clone())
-        };
-        if let Err(error) = crate::fileprovider::append_rescan_marker(&drive_id) {
-            tracing::warn!(
-                target: "drive::remote_events",
-                error = %error,
-                "Failed to record File Provider reconciliation marker"
-            );
-        }
-        crate::fileprovider::signal_containers(
-            &crate::fileprovider::domain_identifier(&drive_id),
-            &drive_name,
-            &[crate::fileprovider::WORKING_SET_CONTAINER.to_string()],
-        );
-        // The working-set refresh repairs visible folders immediately. The
-        // background audit then compares the complete remote metadata tree
-        // against SQLite, so a missed event heals without an app restart.
+        // The worker requests a bounded Finder refresh before searching for
+        // server-side changes. Do not expire anchors on ordinary reconnects.
         self.schedule_fileprovider_recovery().await;
     }
 
@@ -338,6 +322,13 @@ impl Mount {
                     }
                 }
             }
+
+            // Wake Finder immediately after the durable commit. Resolving local
+            // URLs and materialized items below can take seconds per item.
+            crate::fileprovider::signal_containers(
+                &crate::fileprovider::domain_identifier(&drive_id), &drive_name,
+                &[crate::fileprovider::WORKING_SET_CONTAINER.to_string()],
+            );
 
             // Record activity so the tray popup's RECENT list reflects FP
             // sync. Paths point at the File Provider location.

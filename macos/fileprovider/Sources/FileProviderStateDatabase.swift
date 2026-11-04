@@ -42,6 +42,7 @@ final class FileProviderStateDatabase {
                 guard try rows("SELECT version FROM fp_state_schema").first?.first == "1" else {
                     throw NSError(domain: "CloudreveStateSchema", code: 1)
                 }
+                try executeScript(Self.rescanIndex)
             }
         } catch { sqlite3_close(db); db = nil; throw error }
     }
@@ -118,7 +119,8 @@ final class FileProviderStateDatabase {
 
     /// Read head and records in one snapshot. Errors propagate so Finder cannot
     /// acknowledge unread changes as an empty successful enumeration.
-    func eventSnapshot(drive: String, since: Int64?) throws -> (latest: Int64, floor: Int64, events: [Data]) {
+    func eventSnapshot(drive: String, since: Int64?, limit: Int? = nil) throws ->
+        (latest: Int64, floor: Int64, events: [Data], readThrough: Int64, hasMore: Bool, hasRescan: Bool) {
         try execute("BEGIN")
         do {
             let head = try rows("SELECT latest,floor FROM fp_event_heads WHERE drive=? AND imported=1", [drive]).first
@@ -126,14 +128,40 @@ final class FileProviderStateDatabase {
                 throw NSError(domain: "CloudreveStateNotReady", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: "Waiting for Cloudreve to initialize the event journal."])
             }
-            let events: [Data]
+            var events: [Data] = []
+            var readThrough = latest
+            var hasMore = false
+            var hasRescan = false
             if let since {
-                events = try rows("SELECT payload FROM fp_events WHERE drive=? AND sequence>? ORDER BY sequence", [drive, String(since)]).map { Data($0[0].utf8) }
-            } else { events = [] }
+                if let limit {
+                    let count = max(1, min(10_000, limit))
+                    let page = try rows(
+                        "SELECT sequence,payload FROM fp_events WHERE drive=? AND sequence>? ORDER BY sequence LIMIT ?",
+                        [drive, String(since), String(count + 1)])
+                    hasMore = page.count > count
+                    let delivered = page.prefix(count)
+                    events = delivered.map { Data($0[1].utf8) }
+                    if hasMore, let last = delivered.last, let sequence = Int64(last[0]) {
+                        readThrough = sequence
+                    }
+                    // A reset beyond this page must still expire the anchor.
+                    // Inspect only the small JSON type field, not every item
+                    // payload in a potentially large presentation backlog.
+                    hasRescan = try !rows(
+                        "SELECT 1 FROM fp_events WHERE drive=? AND sequence>? AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.type') END='rescan' LIMIT 1",
+                        [drive, String(since)]).isEmpty
+                } else {
+                    events = try rows("SELECT payload FROM fp_events WHERE drive=? AND sequence>? ORDER BY sequence", [drive, String(since)]).map { Data($0[0].utf8) }
+                }
+            }
             try execute("COMMIT")
-            return (latest, floor, events)
+            return (latest, floor, events, readThrough, hasMore, hasRescan)
         } catch { try? execute("ROLLBACK"); throw error }
     }
+
+    // This additive index also upgrades existing version-1 databases. A bounded
+    // replay page must not parse every retained metadata payload to find resets.
+    private static let rescanIndex = "CREATE INDEX IF NOT EXISTS idx_fp_events_rescan ON fp_events(drive,sequence) WHERE CASE WHEN json_valid(payload) THEN json_extract(payload,'$.type') END='rescan';"
 
     // Kept identical to macos/fileprovider/state-schema.sql; parity is tested.
     private static let schema = """

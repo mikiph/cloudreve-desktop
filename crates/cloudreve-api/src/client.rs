@@ -172,6 +172,20 @@ impl Client {
         }
     }
 
+    /// Read the server's clock before an incremental metadata check. Do not use
+    /// the workstation clock as a remote modification-time watermark.
+    pub async fn server_time(&self) -> ApiResult<i64> {
+        let response = self.http_client.get(self.build_url("/site/ping"))
+            .header("Cache-Control", "no-cache")
+            .timeout(std::time::Duration::from_secs(self.config.timeout_seconds))
+            .send().await?.error_for_status()?;
+        let date = response.headers().get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| DateTime::parse_from_rfc2822(value).ok())
+            .ok_or_else(|| ApiError::Other("The server did not provide a valid Date header for checking changes".into()))?;
+        Ok(date.timestamp())
+    }
+
     /// Set a callback to be invoked when credentials are refreshed
     ///
     /// The callback receives the new token information and can perform async operations

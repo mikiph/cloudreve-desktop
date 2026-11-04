@@ -60,7 +60,7 @@ enum DriveStore {
 
 // MARK: - API DTOs
 
-struct RemoteFile: Decodable {
+struct RemoteFile: Codable {
     /// 0 = file, 1 = folder
     let type: Int
     let id: String
@@ -74,9 +74,9 @@ struct RemoteFile: Decodable {
     let owned: Bool?
     let primary_entity: String?
 
-    struct ShareDetails: Decodable {
-        struct Link: Decodable {
-            struct Owner: Decodable { let id: String }
+    struct ShareDetails: Codable {
+        struct Link: Codable {
+            struct Owner: Codable { let id: String }
             let id: String
             let owner: Owner
         }
@@ -220,6 +220,7 @@ enum CloudreveError: Error, LocalizedError {
     case noSuchItem
     case nameCollision
     case staleVersion
+    case unsupportedPackage
     case lockConflict(path: String?, application: String?, ownerID: String?)
     case badResponse(String)
 
@@ -230,9 +231,12 @@ enum CloudreveError: Error, LocalizedError {
         case .notAuthenticated: return "Not authenticated"
         case .noSuchItem: return "No such item"
         case .nameCollision: return "An item with the same name already exists"
+        case .unsupportedPackage: return "This macOS package cannot be uploaded directly. Compress it into a ZIP file and upload the ZIP instead."
         case .staleVersion: return "The item changed on the server before this update was saved"
-        case .lockConflict:
-            return "Someone has this file open online"
+        case .lockConflict(_, let application, _):
+            return application == "upload"
+                ? "An unfinished upload is holding this item"
+                : "Someone has this file open online"
         case .badResponse(let detail): return "Bad response: \(detail)"
         }
     }
@@ -266,6 +270,7 @@ final class CloudreveClient {
         subsystem: "cloudreve.desktop.fileprovider", category: "client")
 
     let baseURL: URL
+    private let driveID: String
     private var credentials: Credentials
     /// Deduplicates concurrent token refreshes.
     private let refreshCoordinator = RefreshCoordinator()
@@ -301,6 +306,7 @@ final class CloudreveClient {
     }
 
     init(drive: DriveConfig, session: URLSession? = nil) {
+        self.driveID = drive.id
         self.baseURL = URL(string: drive.instance_url)!
         self.credentials = drive.credentials
         if let session { self.session = session }
@@ -659,6 +665,33 @@ final class CloudreveClient {
         try await callVoid("POST", "/file/move", body: Body(uris: [uri], dst: dstURI))
     }
 
+    /// Deleting locally may supersede an interrupted upload from this desktop.
+    /// Never force-unlock editor sessions or uploads belonging to another client.
+    func cancelOwnedUploads(under uri: String) async throws {
+        let db = try FileProviderStateDatabase()
+        let records = try db.rows("SELECT key,payload FROM fp_records WHERE namespace=?",
+            ["fileprovider-upload-sessions"])
+        let root = uri.hasSuffix("/") ? String(uri.dropLast()) : uri
+        for record in records where record[0].hasPrefix(driveID + ":") {
+            let value = try JSONDecoder().decode([String: String].self, from: Data(record[1].utf8))
+            guard let path = value["uri"], let id = value["id"],
+                path == root || path.hasPrefix(root + "/") else { continue }
+            struct Body: Encodable { let id: String; let uri: String }
+            do {
+                let current = try await fileInfo(uri: path)
+                guard current.metadata?["sys:upload_session_id"] == id else {
+                    // The old session finished or another client started a newer one.
+                    try db.remove("fileprovider-upload-sessions", record[0])
+                    continue
+                }
+                try await callVoid("DELETE", "/file/upload", body: Body(id: id, uri: path))
+            } catch CloudreveError.noSuchItem {
+                // A completed or already-cancelled session needs no further cancellation.
+            }
+            try db.remove("fileprovider-upload-sessions", record[0])
+        }
+    }
+
     /// Soft-deletes (moves to the Cloudreve trash).
     func deleteFile(uri: String) async throws {
         struct Body: Encodable {
@@ -689,11 +722,17 @@ final class CloudreveClient {
         onProgress: ((Int64, Int64) -> Void)? = nil
     ) async throws
     {
-        let uri = try await resolvedURI(uri, followLeaf: overwrite)
         let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        // File Provider may supply a package directory as one content item.
+        // Opening it as a byte stream produces misleading permission errors and
+        // automatic retries. Preserve local content and pause before networking.
+        if attrs[.type] as? FileAttributeType == .typeDirectory {
+            throw CloudreveError.unsupportedPackage
+        }
         guard let size = (attrs[.size] as? NSNumber)?.int64Value else {
             throw CloudreveError.badResponse("cannot stat \(fileURL.path)")
         }
+        let uri = try await resolvedURI(uri, followLeaf: overwrite)
         let mtime = (attrs[.modificationDate] as? Date).map {
             Int64($0.timeIntervalSince1970)
         }
@@ -716,12 +755,20 @@ final class CloudreveClient {
                 encryption_supported: [UploadEncryptor.supportedAlgorithm],
                 previous: overwrite ? previousVersion : nil))
 
+        let sessionKey = driveID + ":" + credential.session_id
+        do {
+            try FileProviderStateDatabase().put("fileprovider-upload-sessions", sessionKey,
+                try JSONEncoder().encode(["id": credential.session_id, "uri": uri]))
+        } catch {
+            try? await cancelUploadSession(credential: credential, uri: uri)
+            throw error
+        }
         let chunkSize = max(credential.chunk_size ?? 0, 1)
-        let encryptor = try credential.encrypt_metadata.map(UploadEncryptor.init(metadata:))
         progress.totalUnitCount = size
         onProgress?(0, size)
 
         do {
+            let encryptor = try credential.encrypt_metadata.map(UploadEncryptor.init(metadata:))
             let handle = try FileHandle(forReadingFrom: fileURL)
             defer { try? handle.close() }
 
@@ -744,6 +791,7 @@ final class CloudreveClient {
             try? await cancelUploadSession(credential: credential, uri: uri)
             throw error
         }
+        try FileProviderStateDatabase().remove("fileprovider-upload-sessions", sessionKey)
         logger.info("uploaded \(uri, privacy: .public) (\(size) bytes, chunks ok)")
     }
 
@@ -757,6 +805,8 @@ final class CloudreveClient {
         try await callVoid(
             "DELETE", "/file/upload",
             body: Body(id: credential.session_id, uri: uri))
+        try FileProviderStateDatabase().remove("fileprovider-upload-sessions",
+            driveID + ":" + credential.session_id)
     }
 
     private func uploadChunk(

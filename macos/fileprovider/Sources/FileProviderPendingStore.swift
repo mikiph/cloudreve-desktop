@@ -88,6 +88,33 @@ enum FileProviderDownloadSuppressionStore {
     }
 }
 
+/// Native uploadingError also covers deletes. Keep the original mutation across restarts.
+enum FileProviderDeleteIntentStore {
+    static func key(driveID: String, identifier: String) -> String { driveID + ":" + identifier }
+    static func begin(driveID: String, identifier: String, uri: String) throws {
+        try FileProviderStateDatabase().put("fileprovider-delete-intents",
+            key(driveID: driveID, identifier: identifier), Data(uri.utf8))
+    }
+    static func contains(driveID: String, identifier: String) throws -> Bool {
+        try FileProviderStateDatabase().get("fileprovider-delete-intents",
+            key(driveID: driveID, identifier: identifier)) != nil
+    }
+    static func containsURI(driveID: String, uri: String) throws -> Bool {
+        let records = try FileProviderStateDatabase().rows(
+            "SELECT key,payload FROM fp_records WHERE namespace=?", ["fileprovider-delete-intents"])
+        return records.contains { record in
+            guard record[0].hasPrefix(driveID + ":") else { return false }
+            let root = RemoteStore.canonicalURI(record[1])
+            let target = RemoteStore.canonicalURI(uri)
+            return target == root || target.hasPrefix(root + "/")
+        }
+    }
+    static func finish(driveID: String, identifier: String) throws {
+        try FileProviderStateDatabase().remove("fileprovider-delete-intents",
+            key(driveID: driveID, identifier: identifier))
+    }
+}
+
 struct FileProviderPendingRecord: Codable {
     let itemIdentifier: String
     let filename: String
@@ -197,11 +224,12 @@ final class FileProviderPendingMonitor {
     }
 
     private func write(items: [NSFileProviderItem]) throws {
-        let failures = items.compactMap { item -> FileProviderPendingRecord? in
+        let failures = try items.compactMap { item -> FileProviderPendingRecord? in
             let operation: String
             let error: NSError
             if let uploadError = item.uploadingError ?? nil {
-                operation = "upload"
+                operation = try FileProviderDeleteIntentStore.contains(driveID: drive.id,
+                    identifier: item.itemIdentifier.rawValue) ? "delete" : "upload"
                 error = uploadError as NSError
             } else if let downloadError = item.downloadingError ?? nil {
                 operation = "download"

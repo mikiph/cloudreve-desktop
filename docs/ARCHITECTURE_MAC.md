@@ -62,8 +62,9 @@ The normal change path is:
 4. macOS launches or wakes the extension and calls `enumerateChanges`.
 5. The extension reads events after Finder's sync anchor, resolves current
    metadata through Cloudreve, and reports updates or deletions to Finder.
-6. Events are returned in pages of 100. `moreComing` asks macOS for the next
-   page, preventing a large recovery delta from monopolizing the extension.
+6. Replay reads at most 32 journal records at a time and budgets their contained
+   metadata updates. `moreComing` asks macOS for the next page. A reset-marker
+   index finds expired anchors without decoding the entire retained backlog.
 
 The working-set feed is domain-wide. A change is not discarded merely because
 its folder has not recently appeared in Finder. This is essential for newly
@@ -80,30 +81,172 @@ SSE connections can be interrupted while the app is stopped, the network is
 unavailable, or the server requests a reconnect. Cloudreve therefore does not
 assume that reconnecting SSE reveals the missing interval.
 
-On every confirmed subscription or reconnection:
+Starting with build 188, startup, confirmed subscriptions and the menu refresh
+button perform incremental server searches instead of walking the remote tree.
+The existing SSE connection continues to deliver live changes.
 
-1. The app records a rescan marker and signals the working set. The extension
-   expires the affected anchor and quickly reconciles Finder's existing working
-   set and presented folders.
-2. In parallel, a metadata-only background audit walks the remote hierarchy in
-   pages of 200, with a small delay between directories.
-3. Each item is compared by stable remote ID with the
-   `fileprovider_remote_items` SQLite table. New, modified, renamed, and deleted
-   items become normal File Provider events.
-4. Each page updates inventory and inserts its outgoing events into an outbox
-   in the same `meta.db` transaction. The outbox delivers to `fileprovider.db`
-   using unique batch IDs, making retries after a crash idempotent. Deletions
-   are inferred only after the complete traversal succeeds, and their events
-   are queued in the same transaction that removes the inventory rows.
-5. Descendant deletions are collapsed when an absent parent folder already
-   represents the subtree.
+1. A `refresh_presented` journal event durably queues the root and the bounded,
+   recently presented folder set. Starting with build 189, this network work
+   runs outside change replay, in round-robin pages. Repeated requests coalesce.
+   Page results and queue progress commit together in SQLite. Missing children
+   are considered only after that folder's complete listing. This does not
+   recursively walk pinned trees or delay discovered changes behind every folder.
+   Missing candidates are separate indexed rows and are verified in small batches
+   before deletion. The queue does not rewrite a whole folder's identity map for
+   every page. Metadata fingerprints suppress unchanged results.
+2. The host reads the server Date header and queries the configured root with
+   `updated_gte` and `created_gte` in separate paged searches. The creation query
+   also catches newly uploaded files with preserved older modification times.
+3. Only the returned IDs are looked up in the indexed SQLite inventory. Stable
+   ID, URI, modification time, size, type and primary entity identify changes.
+   Inventory and outgoing events commit together through the existing outbox.
+4. The server-time checkpoint in `fp-search-checkpoint` advances only after both
+   searches and durable deliveries succeed. A two-minute overlap reduces time
+   boundary gaps, but pagination is not a consistent server snapshot. Failed or truncated searches retain
+   the checkpoint and report a retry. Search absence never means deletion.
+5. On migration, the oldest existing inventory observation establishes the
+   starting interval, translated to the server clock. New drives start at the
+   current interval and get existing items through normal Finder enumeration.
+   No initial whole-drive inventory walk is required.
 
-The first audit after the recovery table is introduced establishes a baseline
-without emitting every remote item as a new Finder entry. Later audits emit only
-deltas. Received-share redirect folders are not recursively traversed because
-their target hierarchy and permissions are represented separately.
+The server check and native delivery have separate completion states. A completed
+check records its journal target. The extension records `fp-applied` after
+returning working-set changes to macOS. The menu shows **Checking for changes…** until
+that target and any pending `fp-folder-refresh` results have been delivered.
+The tooltip's last-check timestamp describes the server check. It does not prove
+all content has downloaded or every uncached directory has been verified.
 
-The audit fetches metadata only. It does not materialize remote files locally.
+Metadata replay never waits for native content eviction or materialization.
+Those operations can themselves depend on Finder consuming the metadata.
+Materialized-content refresh runs after enumeration finishes, skips local upload
+echoes, and checks local materialization before requesting content. Working-set
+signals do not wait behind the native download gate. Only working-set signals
+are supported by replicated File Provider extensions, so signalling individual
+folder enumerators is not used as a recovery mechanism.
+
+This is best-effort recovery within the current server API. Neither timestamp
+search nor a local hash is a complete remote change log. Permanent deletions,
+items moved out of the configured root, old descendants moved into a subtree,
+and edits with backdated timestamps may not be returned. Live SSE covers these
+when delivered while connected. Presented-folder reconciliation covers recently used locations.
+The remaining offline gaps require the explicit **Full check** in drive Settings.
+Do not claim that normal check completion proves the entire drive is identical.
+Search work may still be substantial after a long absence or many real changes,
+and the server may impose search-depth limits. It does not silently fall back
+to recursive traversal when a search is unsupported or truncated.
+
+Full check performs the previous metadata-only traversal in pages of 200. It
+preserves downloads, pins and domain identity. A complete pass alone infers
+missing inventory items as deletions, collapsing descendants of missing folders.
+It refreshes Finder's working set and updates the incremental checkpoint after
+success. An empty inventory establishes a baseline without creating activity
+for every existing file. Received-share redirects are not recursively traversed.
+Full check is never scheduled automatically by startup, reconnect or menu refresh.
+
+API references: [List files](https://cloudrevev4.apifox.cn/list-files-300233178e0),
+[URI search conditions](https://docs.cloudreve.org/en/api/file-uri),
+[Events stream](https://cloudrevev4.apifox.cn/events-stream-413501323e0).
+The Pro [file activity API](https://cloudrevev4.apifox.cn/list-file-activities-300250878e0)
+is not documented as a durable drive-wide sync cursor.
+
+Long-term recovery needs fair background verification of cached and pinned
+directories beyond the presented-folder limit. Timestamp searches are an
+accelerator, not a complete change journal. The upstream search implementation
+also traverses folder levels on the server, so its cost is not necessarily
+proportional to the number of returned changes. Local hashes cannot detect
+changes in remote metadata that has not been fetched. Build 189 addresses the
+observed delivery stall, and does not claim to finish this broader recovery work.
+
+## Folder moves and targeted recovery (build 190)
+
+A folder move now remaps every known descendant URI while retaining stable item
+identifiers and pin selections. Identity snapshot writes are serialized using a
+fresh snapshot, so concurrent callbacks cannot overwrite a newer mapping.
+Requests already running against the previous path cannot evict moved items.
+Presented-folder checks wait for pending move events, restart queued pages whose
+container moved, and reject results captured at a stale location.
+
+New and moved directories receive a durable paged subtree check. This discovers
+children whose creation and modification dates did not change when their parent
+moved. Unrelated trees are not traversed. Ordinary metadata changes to an already
+known directory do not schedule recursive discovery. Shared redirects are excluded.
+Each page publishes metadata promptly and persists newly discovered child folders
+in the same transaction. Checks that produce no new journal records no longer
+signal an empty working-set replay.
+
+A one-time `fp-move-repair-v190` cursor revisits retained, previously acknowledged
+move destinations. It queues affected directories, so upgrades can recover
+children incorrectly removed by older builds without resetting the domain. It
+cannot reconstruct moves that have already fallen outside journal retention.
+
+The footer uses **Checking for changes…** throughout. Its refresh tooltip reports
+items checked, folders remaining, and how many folders are retrying. Remaining
+folder counts can grow as a new subtree is discovered. They are not percentages
+or estimates of content transfer progress.
+
+Cloudreve exposes file/upload ETags, but its public WebDAV implementation excludes
+`getetag` for directories. It therefore does not provide Nextcloud's folder-ETag
+contract for skipping unchanged subtrees. A local metadata fingerprint suppresses
+unchanged deliveries after listing, but cannot prove that an unfetched remote
+folder is unchanged. See [Cloudreve WebDAV properties](https://github.com/cloudreve/Cloudreve/blob/master/pkg/webdav/prop.go)
+and [Nextcloud discovery](https://github.com/nextcloud/desktop/blob/master/src/libsync/discovery.cpp).
+
+## Refresh scale and concurrent changes (build 191)
+
+A routine check remains bounded to the drive root and at most 128 recently
+presented directories, plus targeted newly introduced or moved subtrees. Having
+3,000 existing directories does not by itself schedule 3,000 directory checks.
+A new subtree with 3,000 directories does require listing those affected
+directories to discover their contents. The server's timestamp-search work and
+network latency are additional costs.
+
+Page commits now examine only relevant journal changes. Unrelated live traffic
+cannot repeatedly invalidate a stable directory listing. Membership changes in
+the checked directory restart its pagination, including changes arriving between
+pages. Metadata changes to returned items invalidate an in-flight stale result.
+The validation watermark advances after each committed page, avoiding repeated
+decoding of the whole earlier result backlog. Retention gaps, reset markers and
+pending moves remain conservative barriers. A directory under continuous local
+membership changes may require a quiet interval to complete its check, while
+other directories and live event delivery continue.
+
+Completed directory listings persist per-parent membership and stable directory
+locations in SQLite. This lets a shallow listing identify an offline move or a
+new child directory and queue its old-timestamp descendants. The first baseline
+stays shallow. Membership, continuation, result journal and discovery jobs share
+the page transaction. Promoting an existing shallow request to recursive starts
+again at its first page so earlier nested directories are included.
+
+The extension maintains an immediate-parent index for cached identities, avoiding
+an entire identity-map scan for each candidate set. Metadata replay and direct
+folder enumeration persist identities once per page, rather than once per item.
+Those snapshots still contain the full identity map. Long-term migration of
+private identity state to indexed rows would further reduce very large initial
+replay costs.
+
+The footer displays checked server items while the search runs, then completed
+folders out of the current check's discovered total, for example **37/129
+folders**. Totals can grow with discovery. Completed drives do not contribute
+stale counters to an active drive's progress. This is a work count, not an ETA or
+a claim that every directory in the drive has been audited.
+
+See MACOS_SYNC_QA.md for measured isolated stress workloads and the remaining
+recovery limits above. The hybrid of live events, timestamp searches and bounded
+reconciliation is appropriate for the current API, but does not provide a durable
+server change-log guarantee or eliminate the need for explicit Full check in
+cold offline edge cases.
+
+## Resuming checks after extension suspension (build 192)
+
+macOS can invalidate the extension while its independent refresh worker still has
+queued folders. Preserving the queue is insufficient unless something requests
+another native enumeration. The desktop app's existing three-second connection
+supervisor now checks durable work while a drive is connected. It signals only
+the working set, at most once per five seconds per drive, until the folder queue
+and its delivery target are complete. Quiet drives stop receiving these wakes.
+No additional recovery marker, server search or folder pass is created by a wake.
+This makes saved progress eligible to resume after extension suspension even
+when no server change or Finder interaction occurs.
 
 ## Finder-to-remote synchronization
 
@@ -133,9 +276,9 @@ requests it and schedules refreshes for remotely modified materialized files.
   consistent snapshot.
 - Rescan markers intentionally expire anchors when continuity is uncertain.
 
-The recently presented-folder cache is an optimization for fast reconciliation,
-not a correctness boundary. Increasing or decreasing its bound must never decide
-whether a real remote change reaches Finder.
+The recently presented-folder cache bounds routine reconciliation. Live events
+and server searches are domain-wide. Offline deletions outside that bounded
+set are an acknowledged API limitation and can require explicit Full check.
 
 ## Shares
 
@@ -176,6 +319,11 @@ The shared database contains:
   receipts, retry/pin requests, conflict metadata/actions, share baselines,
   and explicit reset requests;
 - `fp_imports`: completed legacy-directory imports.
+
+Build 189 also uses `fp-applied`, `fp-folder-refresh` and per-request candidate
+namespaces for durable paged refresh and native delivery status. The additive
+`idx_fp_events_rescan` index is installed for both new and existing version-1
+databases by either process.
 
 Snapshots and small request payloads retain their existing JSON encoding inside
 database rows; they no longer require one file per record. Conflict read/modify/
@@ -294,6 +442,15 @@ codesign --verify --deep --strict \
 Do not package a raw `cargo build --release` binary as the app: it lacks Tauri's
 production custom-protocol configuration and attempts to load the development
 server. For local handoff, provide the `.app` bundle directly rather than a ZIP.
+When transferring to another Mac through Cloudreve, provide a DMG containing the
+finished app rather than synchronizing the raw `.app` directory. The current
+provider's `fileSystemFlags` exposes readable/writable permissions and does not
+preserve executable bits or extended attributes. A raw app bundle can therefore
+arrive without executable permissions. A disk image preserves the internal
+filesystem metadata. Verify the image checksum, both executable permissions and
+the app's deep signature after mounting it read-only. This does not add Developer
+ID signing/notarization or bypass Gatekeeper.
+
 Public releases use a DMG for installation and a separately signed `.app.tar.gz`
 for the updater; both contain the same final embedded bundle. See
 [`RELEASING.md`](RELEASING.md) for the required packaging and publication order.
@@ -318,3 +475,107 @@ retains its existing package-managed update mechanism and Explorer integration.
 Updater signatures are not Apple code-signing certificates. Current ad-hoc
 releases are not notarized and cannot promise that security warnings appear only
 once. No Gatekeeper or quarantine bypass is implemented.
+
+## Connection state, setup and recovery activity (build 187)
+
+The host reconciles native connection state against the confirmed event-stream
+subscription and credential status every three seconds, retrying native errors.
+It reasserts state every thirty seconds to recover after wake. A successful
+registration is not a successful server connection. Settings reads the native
+`isDisconnected` and `userEnabled` flags rather than treating an accepted
+`signalEnumerator` request as a health check. The SSE idle timeout remains 90
+seconds, so detecting a silently broken connection is bounded by that timeout,
+not by the three-second native-state polling interval. Force termination cannot
+run a graceful disconnect; do not claim that crash/force-quit is equivalent to
+normal Quit.
+
+Host domain operations share a lifecycle lock. Reset writes its explicit
+identity/pin-reset request only after removal succeeds and the registration is
+absent. Removal preserves dirty user data, and reset returns the recovered-file
+location to Settings. Registration, removal and reset invalidate the host's
+cached Finder root path. A native Cocoa file-exists error during registration
+gets one safe retry using the configured name plus a stable eight-character
+identity suffix. No other error is treated as a naming conflict, and no
+CloudStorage folders or older app identities are deleted to free a name.
+
+Onboarding persists the account first, then registers and opens its actual
+Finder directory. It stays open while native approval is pending, checks
+`userEnabled` and `isDisconnected`, and attempts a read-only directory listing
+before reporting success. This can trigger macOS's File Provider domain access
+prompt; `NSFileProviderDomainUsageDescription` explains the access. A denied
+permission remains a retryable setup state, with a System Settings action.
+macOS owns the Allow/Enable UI; there is no app-side auto-approval. Full Disk
+Access, Accessibility and Automation permissions are not requested for this
+flow. Notifications and launch-at-login preferences are separate from required
+Finder setup. See Apple's [File Provider access description](https://developer.apple.com/documentation/bundleresources/information-property-list/nsfileproviderdomainusagedescription).
+
+Recovery begins on app startup independently of SSE, and also follows confirmed
+subscriptions. A reconnect during an active check queues another pass. Native
+connection-state retries do not schedule duplicate recovery work. The `fp-recovery`
+record stores the latest phase, counts, retry error and a separate last successful
+completion time. Failed attempts do not replace the successful-check timestamp.
+The footer has one small refresh icon. Its tooltip shows each selected drive's
+last check, with full-check progress or retry details when applicable. There is
+no separate progress panel or full-width refresh button. Completion means server
+metadata was checked and delivered to the journal, while macOS schedules the
+remaining enumeration and content work.
+
+Settings offers System default, 12-hour and 24-hour clock formats. The optional
+`clock_hour12` preference defaults to null for existing and new configurations.
+On macOS, the effective system format comes from Foundation's localized `j`
+template so a user's clock override is respected independently of app language.
+Preferences update existing popup windows through an event and are reread on focus.
+
+The menu popup is positioned while hidden, using AppKit global logical points
+for both cursor and screen frames. It is then ordered on the clicked display
+with all-Spaces/full-screen auxiliary behavior. No primary-display scaling is
+applied to a secondary monitor.
+
+The macOS extension chunks local/relay uploads and attempts to cancel the session
+on an error. Build 193 records its own session IDs and URIs in SQLite before
+uploading chunks. A local deletion cancels matching owned sessions in that
+subtree only after verifying the server still reports the same session ID.
+Failed cancellations remain recorded for a later deletion retry. Editor locks
+and other clients’ upload sessions are never force-unlocked. The Rust uploader retries chunks but also
+discards an existing saved session when restarting an upload. Neither path
+currently guarantees durable byte-offset resume after interruption. SQLite
+storage alone does not provide that guarantee.
+
+For native acceptance testing, use [MACOS_SYNC_QA.md](MACOS_SYNC_QA.md).
+
+## Pending deletions (build 193)
+
+Native `uploadingError` covers failed outgoing metadata mutations as well as
+content uploads. Before sending a deletion, the extension persists its delete
+intent by drive and item identity. Pending-item snapshots and the activity UI
+then report `delete`, and Retry deletion clears the native error so macOS can
+retry the original operation. It must never call `requestModificationOfFields`
+for content, which would request an upload of an item the user removed.
+A pending delete blocks creates and content modifications in its subtree.
+Ancestor delete generations also protect uploads already in flight. Success or
+an already absent server item clears the intent. No domain reset is involved.
+
+The public metadata API validates a fixed set of metadata categories and rejects
+arbitrary desktop permission keys on the tested server. Do not claim that raw
+app bundles preserve executable permissions or use unrelated metadata fields to
+hide those permissions. Transfer installation bundles inside DMG or ZIP files.
+`test-mutation-recovery.sh` covers retained sessions after failed cancellation,
+drive and subtree isolation, pending delete intent, ancestor deletion races and
+accurate upload-lock error messages.
+
+## Package failures and retry history (build 194)
+
+File Provider can hand a package directory to createItem/modifyItem as one content
+item. The byte uploader rejects directory content before any network request or
+upload session. It returns CannotSynchronize with ZIP instructions, so macOS
+pauses the unsupported operation rather than retrying permission/timeout errors
+indefinitely. This does not delete, exclude, or acknowledge the local package as
+successfully uploaded. Ordinary folders still use the folder creation path.
+Local modifications and extension/OS updates may cause macOS to attempt it again,
+in which case the same source validation applies.
+
+The Recent list groups native transfer attempts by drive, path and direction
+across time gaps and interleaved activity. The newest outcome leads the single
+row, and earlier attempts remain in expandable history. Failed rows include their
+age so historical errors are not mistaken for active transfers. Transient network
+errors for regular files remain retryable. No errors are silently discarded.

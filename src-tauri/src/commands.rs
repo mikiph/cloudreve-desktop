@@ -11,11 +11,6 @@ use cloudreve_sync::{
     config::LogLevel, ConfigManager, Credentials, DriveConfig, DriveInfo, StatusSummary,
 };
 #[cfg(target_os = "macos")]
-use core_graphics::{
-    event::CGEvent,
-    event_source::{CGEventSource, CGEventSourceStateID},
-};
-#[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
 #[cfg(target_os = "macos")]
 use objc2::MainThreadMarker;
@@ -25,10 +20,10 @@ use objc2_app_kit::NSApp as ns_app;
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSColor,
     NSFloatingWindowLevel, NSFontWeightSemibold, NSImage, NSImageSymbolConfiguration, NSWindow,
-    NSWindowButton, NSWindowCollectionBehavior,
+    NSWindowButton, NSWindowCollectionBehavior, NSEvent, NSScreen,
 };
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSDictionary, NSString};
+use objc2_foundation::{NSDictionary, NSString, NSPoint};
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
@@ -614,6 +609,8 @@ pub async fn add_drive(
     state: State<'_, AppStateHandle>,
     config: AddDriveArgs,
 ) -> CommandResult<String> {
+    #[cfg(target_os = "macos")]
+    let _operation = cloudreve_sync::fileprovider::DOMAIN_OPERATIONS.lock().await;
     let site_url =
         tauri::Url::parse(&config.site_url).map_err(|e| format!("Invalid Cloudreve URL: {e}"))?;
     if site_url.scheme() != "https" {
@@ -716,18 +713,8 @@ pub async fn add_drive(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Register a File Provider domain for the new drive (macOS only, best-effort)
-    #[cfg(target_os = "macos")]
-    {
-        if let Err(e) = cloudreve_sync::fileprovider::add_domain(
-            &cloudreve_sync::fileprovider::domain_identifier(&id),
-            &config.drive_name,
-        )
-        .await
-        {
-            tracing::warn!(target: "fileprovider", "failed to register FP domain for {id}: {e:#}");
-        }
-    }
+    // Finder registration is a separate, retryable setup step. The UI retains
+    // this saved ID even when macOS cannot register the location yet.
 
     Ok(id)
 }
@@ -738,9 +725,22 @@ pub async fn remove_drive(
     state: State<'_, AppStateHandle>,
     drive_id: String,
 ) -> CommandResult<Option<DriveConfig>> {
+    #[cfg(target_os = "macos")]
+    let _operation = cloudreve_sync::fileprovider::DOMAIN_OPERATIONS.lock().await;
     let app_state = state
         .get()
         .ok_or_else(|| "App not yet initialized".to_string())?;
+
+    #[cfg(target_os = "macos")]
+    if let Some(mount) = app_state.drive_manager.get_drive(&drive_id).await {
+        let drive = mount.get_config().await;
+        let domain = cloudreve_sync::fileprovider::domain_identifier(&drive_id);
+        let domains = cloudreve_sync::fileprovider::list_domains().await.map_err(|e| e.to_string())?;
+        if domains.iter().any(|(id, _)| id == &domain) {
+            cloudreve_sync::fileprovider::remove_domain(&domain, &drive.name).await.map_err(|e| e.to_string())?;
+        }
+        cloudreve_sync::fileprovider::wait_for_domain_removal(&domain).await.map_err(|e| e.to_string())?;
+    }
 
     let result = app_state
         .drive_manager
@@ -755,19 +755,6 @@ pub async fn remove_drive(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Remove the drive's File Provider domain (macOS only, best-effort).
-    // Note: this also deletes the local replica under ~/Library/CloudStorage.
-    #[cfg(target_os = "macos")]
-    if let Some(ref drive) = result {
-        if let Err(e) = cloudreve_sync::fileprovider::remove_domain(
-            &cloudreve_sync::fileprovider::domain_identifier(&drive_id),
-            &drive.name,
-        )
-        .await
-        {
-            tracing::warn!(target: "fileprovider", "failed to remove FP domain for {drive_id}: {e:#}");
-        }
-    }
 
     Ok(result)
 }
@@ -1026,6 +1013,9 @@ pub async fn resolve_file_provider_issue(
         return Err("Only retry is available for this Finder issue".to_string());
     }
     match issue.operation.as_str() {
+        "delete" => cloudreve_sync::fileprovider::retry_item_deletion(
+            &domain_id, &drive.name, issue.error_domain.as_deref(), issue.error_code,
+        ).await.map_err(|error| error.to_string()),
         "upload" => cloudreve_sync::fileprovider::retry_item_upload(
             &domain_id,
             &drive.name,
@@ -1075,6 +1065,109 @@ pub async fn reveal_file_provider_issue(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn refresh_finder(state: State<'_, AppStateHandle>, drive_id: Option<String>) -> CommandResult<()> {
+    let _operation = cloudreve_sync::fileprovider::DOMAIN_OPERATIONS.lock().await;
+    let app_state = state.get().ok_or("App not yet initialized")?;
+    for drive in app_state.drive_manager.list_drives().await.into_iter()
+        .filter(|drive| drive.enabled && drive_id.as_ref().map_or(true, |id| id == &drive.id)) {
+        if let Some(mount) = app_state.drive_manager.get_drive(&drive.id).await {
+            mount.schedule_fileprovider_recovery().await;
+        }
+    }
+    Ok(())
+}
+
+/// Explicit, non-destructive repair for gaps the server search cannot describe.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn full_check_finder(state: State<'_, AppStateHandle>, drive_id: String) -> CommandResult<()> {
+    let app_state = state.get().ok_or("App not yet initialized")?;
+    let mount = app_state.drive_manager.get_drive(&drive_id).await.ok_or("Drive is not enabled")?;
+    mount.schedule_fileprovider_full_recovery().await;
+    Ok(())
+}
+
+/// Check real directory access during user-initiated onboarding. Opening the
+/// root in Finder exposes its native enable/Allow UI; this metadata-only read
+/// also lets TCC present the app's File Provider access prompt when required.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn verify_finder_setup(state: State<'_, AppStateHandle>, drive_id: String) -> CommandResult<()> {
+    let app_state = state.get().ok_or("App not yet initialized")?;
+    let mount = app_state.drive_manager.get_drive(&drive_id).await.ok_or("Drive no longer exists")?;
+    let drive = mount.get_config().await;
+    let status = cloudreve_sync::fileprovider::domain_status(&drive.id, &drive.name).await;
+    if !status.connected {
+        return Err(status.message.unwrap_or_else(|| "Finder is not ready yet".into()));
+    }
+    let path = cloudreve_sync::fileprovider::user_visible_item_url(
+        &cloudreve_sync::fileprovider::domain_identifier(&drive.id), &drive.name,
+        cloudreve_sync::fileprovider::ROOT_CONTAINER,
+    ).await.ok_or("Finder is preparing this location. Approve Cloudreve in the Finder window, then try again.")?;
+    // Do not hold the domain operation lock while waiting for a consent dialog.
+    tokio::task::spawn_blocking(move || {
+        let mut entries = std::fs::read_dir(&path).map_err(|error|
+            format!("Cloudreve could not access its Finder location: {error}. Allow access in the macOS prompt. If access was denied, enable Cloudreve under System Settings → Privacy & Security → Files and Folders, then retry."))?;
+        if let Some(entry) = entries.next() { entry.map_err(|e| e.to_string())?; }
+        Ok(())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn open_finder_setup_settings() -> CommandResult<()> {
+    let status = tokio::process::Command::new("/usr/bin/open")
+        .arg("/System/Applications/System Settings.app").status().await.map_err(|e| e.to_string())?;
+    if status.success() { Ok(()) } else { Err("Could not open System Settings".into()) }
+}
+
+/// Complete or retry Finder setup without exchanging the one-use OAuth code again.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn complete_finder_setup(
+    state: State<'_, AppStateHandle>, drive_id: String, drive_name: Option<String>,
+) -> CommandResult<String> {
+    let _operation = cloudreve_sync::fileprovider::DOMAIN_OPERATIONS.lock().await;
+    let app_state = state.get().ok_or("App not yet initialized")?;
+    let mount = app_state.drive_manager.get_drive(&drive_id).await.ok_or("Drive no longer exists")?;
+    let mut drive = mount.get_config().await;
+    let domain = cloudreve_sync::fileprovider::domain_identifier(&drive.id);
+    if let Some(name) = drive_name {
+        let name = name.trim();
+        if name.is_empty() || name.contains('/') || name.contains(':') {
+            return Err("Choose a drive name without slashes or colons.".into());
+        }
+        // Renaming is offered only while registration is missing.
+        if !cloudreve_sync::fileprovider::list_domains().await.map_err(|e| e.to_string())?
+            .iter().any(|(id, _)| id == &domain) {
+            mount.config.write().await.name = name.into();
+            drive.name = name.into();
+            app_state.drive_manager.persist().await.map_err(|e| e.to_string())?;
+        }
+    }
+    cloudreve_sync::fileprovider::ensure_domain(&domain, &drive.name).await.map_err(|e| format!("{e:#}"))?;
+    let flags = mount.get_status_flags().await;
+    cloudreve_sync::fileprovider::set_domain_connected(&domain, &drive.name,
+        flags.is_event_push_subscribed() && !flags.is_credential_expired(),
+        "Cloudreve is reconnecting to the server. Syncing resumes automatically.").await.map_err(|e| e.to_string())?;
+    cloudreve_sync::fileprovider::append_rescan_marker(&drive.id).map_err(|e| e.to_string())?;
+    cloudreve_sync::fileprovider::signal_containers(&domain, &drive.name, &[
+        cloudreve_sync::fileprovider::WORKING_SET_CONTAINER.into(),
+        cloudreve_sync::fileprovider::ROOT_CONTAINER.into(),
+    ]);
+    mount.schedule_fileprovider_recovery().await;
+    let path = cloudreve_sync::fileprovider::user_visible_item_url(&domain, &drive.name,
+        cloudreve_sync::fileprovider::ROOT_CONTAINER).await
+        .ok_or_else(|| "Your account is saved. Finder is still preparing the location. Enable Cloudreve in System Settings → General → Login Items & Extensions → File Providers if prompted, then retry.".to_string())?;
+    // Opening the actual directory (not revealing its parent) brings Finder's
+    // first-use approval UI to the foreground while onboarding remains open.
+    let status = tokio::process::Command::new("/usr/bin/open").arg(&path).status().await.map_err(|e| e.to_string())?;
+    if !status.success() { return Err("Could not open the Finder location. Retry to finish setup.".into()); }
+    Ok(path)
+}
+
 /// Get all drives with their status information for the settings UI
 #[tauri::command]
 pub async fn get_drives_info(state: State<'_, AppStateHandle>) -> CommandResult<Vec<DriveInfo>> {
@@ -1094,7 +1187,8 @@ pub async fn get_drives_info(state: State<'_, AppStateHandle>) -> CommandResult<
 pub async fn reset_file_provider(
     state: State<'_, AppStateHandle>,
     drive_id: String,
-) -> CommandResult<()> {
+) -> CommandResult<Option<String>> {
+    let _operation = cloudreve_sync::fileprovider::DOMAIN_OPERATIONS.lock().await;
     let app_state = state
         .get()
         .ok_or_else(|| "App not yet initialized".to_string())?;
@@ -1107,23 +1201,29 @@ pub async fn reset_file_provider(
         .ok_or_else(|| format!("Drive not found: {drive_id}"))?;
 
     let domain_id = cloudreve_sync::fileprovider::domain_identifier(&drive.id);
-    cloudreve_sync::fileprovider::request_local_state_reset(&drive.id)
-        .map_err(|error| format!("Could not prepare Finder reset: {error:#}"))?;
     let registered = cloudreve_sync::fileprovider::list_domains()
         .await
         .map_err(|error| format!("Could not inspect Finder integration: {error:#}"))?;
 
-    if registered.iter().any(|(id, _)| id == &domain_id) {
+    let preserved = if registered.iter().any(|(id, _)| id == &domain_id) {
         cloudreve_sync::fileprovider::remove_domain(&domain_id, &drive.name)
             .await
-            .map_err(|error| format!("Could not remove Finder integration: {error:#}"))?;
+            .map_err(|error| format!("Could not remove Finder integration: {error:#}"))?
+    } else { None };
+
+    cloudreve_sync::fileprovider::wait_for_domain_removal(&domain_id).await
+        .map_err(|error| format!("Could not finish Finder removal: {error:#}"))?;
+    cloudreve_sync::fileprovider::request_local_state_reset(&drive.id)
+        .map_err(|error| format!("Could not prepare Finder reset: {error:#}"))?;
+    cloudreve_sync::fileprovider::ensure_domain(&domain_id, &drive.name).await
+        .map_err(|error| format!("Could not restore Finder integration: {error:#}. Retry Set up Finder in Settings. Your account is still saved.{}",
+            preserved.as_ref().map(|path| format!(" Unsent edits were preserved at {path}. Review them before deleting them.")).unwrap_or_default()))?;
+    cloudreve_sync::fileprovider::append_rescan_marker(&drive.id).map_err(|e| e.to_string())?;
+    if let Some(mount) = app_state.drive_manager.get_drive(&drive.id).await {
+        mount.schedule_fileprovider_recovery().await;
     }
 
-    cloudreve_sync::fileprovider::add_domain(&domain_id, &drive.name)
-        .await
-        .map_err(|error| format!("Could not add Finder integration: {error:#}"))?;
-
-    Ok(())
+    Ok(preserved)
 }
 
 /// File icon response containing base64 encoded RGBA pixel data
@@ -1231,22 +1331,55 @@ pub fn show_main_window(app: &AppHandle) {
 
 /// Show the main popup at the clicked screen position.
 #[cfg(target_os = "macos")]
-pub fn show_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>) {
-    // Prefer the hardware cursor position for proxied status items.
-    let click = hardware_cursor_position(app).unwrap_or(click);
-    show_main_window_at_position(app, Position::TrayCenter);
+pub fn show_main_window_at_click(app: &AppHandle, _click: PhysicalPosition<f64>) {
+    // Prepare while hidden: showing/focusing on the old screen first can move
+    // the user's active Space before we have a chance to reposition the popup.
+    prepare_main_window(app, Position::TrayCenter, false);
+    let Some(window) = app.get_webview_window("main_popup") else { return; };
+    let app = app.clone();
+    let dispatcher = app.clone();
+    if let Err(error) = dispatcher.run_on_main_thread(move || {
+        let Some(mtm) = MainThreadMarker::new() else { return; };
+        let Ok(handle) = window.ns_window() else { return; };
+        let native = unsafe { &*handle.cast::<NSWindow>() };
+        // AppKit screen frames, cursor and window frames all use global logical
+        // points. Multiplying by the primary monitor's scale breaks mixed-DPI
+        // layouts and displays to the left/above the built-in screen.
+        let cursor = NSEvent::mouseLocation();
+        let screens = NSScreen::screens(mtm);
+        let Some(screen) = screens.iter().find(|screen| {
+            let frame = screen.frame();
+            cursor.x >= frame.origin.x && cursor.x < frame.origin.x + frame.size.width
+                && cursor.y >= frame.origin.y && cursor.y < frame.origin.y + frame.size.height
+        }) else { return; };
+        let frame = screen.visibleFrame();
+        let size = native.frame().size;
+        let (x, y) = popup_origin(cursor.x, frame.origin.x, frame.origin.y,
+            frame.size.width, frame.size.height, size.width, size.height);
+        native.setCollectionBehavior(
+            native.collectionBehavior().difference(NSWindowCollectionBehavior::MoveToActiveSpace)
+                | NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        native.setFrameOrigin(NSPoint::new(x, y));
+        SUPPRESS_MAIN_POPUP_FOCUS_LOSS_UNTIL_MS.store(monotonic_popup_time_ms() + 300, Ordering::Relaxed);
+        let _ = window.show();
+        crate::update_dock_visibility(&app);
+        native.setLevel(NSFloatingWindowLevel);
+        #[allow(deprecated)]
+        ns_app(mtm).activateIgnoringOtherApps(true);
+        native.makeKeyAndOrderFront(None);
+    }) {
+        tracing::warn!(target: "main_popup", %error, "Could not show popup on the clicked display");
+    }
+}
 
-    let Some(window) = app.get_webview_window("main_popup") else {
-        return;
-    };
-    position_main_window_at_click(&window, click);
-
-    // Reapply the position after the status-item callback settles.
-    let window = window.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        position_main_window_at_click(&window, click);
-    });
+/// AppKit coordinates have their origin at the bottom left.
+#[cfg(target_os = "macos")]
+fn popup_origin(cursor_x: f64, x: f64, y: f64, width: f64, height: f64,
+    popup_width: f64, popup_height: f64) -> (f64, f64) {
+    ((cursor_x - popup_width / 2.0).clamp(x, (x + width - popup_width).max(x)),
+        (y + height - popup_height - 8.0).max(y))
 }
 
 /// Toggle the tray popup at the clicked position.
@@ -1272,58 +1405,6 @@ pub fn toggle_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>
     }
 
     show_main_window_at_click(app, click);
-}
-
-#[cfg(target_os = "macos")]
-fn hardware_cursor_position(app: &AppHandle) -> Option<PhysicalPosition<f64>> {
-    // Use HID coordinates instead of proxy status-item coordinates.
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
-    let location = CGEvent::new(source).ok()?.location();
-    let scale = app.primary_monitor().ok().flatten()?.scale_factor();
-    Some(PhysicalPosition::new(
-        location.x * scale,
-        location.y * scale,
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn position_main_window_at_click(window: &WebviewWindow, click: PhysicalPosition<f64>) {
-    let Ok(monitors) = window.available_monitors() else {
-        return;
-    };
-    let monitor = monitors.into_iter().find(|monitor| {
-        let position = monitor.position();
-        let size = monitor.size();
-        click.x >= position.x as f64
-            && click.x < (position.x + size.width as i32) as f64
-            && click.y >= position.y as f64
-            && click.y < (position.y + size.height as i32) as f64
-    });
-    let Some(monitor) = monitor.or_else(|| window.primary_monitor().ok().flatten()) else {
-        return;
-    };
-    let Ok(window_size) = window.outer_size() else {
-        return;
-    };
-
-    let monitor_position = monitor.position();
-    let monitor_size = monitor.size();
-    let scale = monitor.scale_factor();
-    let min_x = monitor_position.x;
-    let max_x = monitor_position.x + monitor_size.width as i32 - window_size.width as i32;
-    let min_y = monitor_position.y;
-    let max_y = monitor_position.y + monitor_size.height as i32 - window_size.height as i32;
-    let x = (click.x.round() as i32 - window_size.width as i32 / 2).clamp(min_x, max_x);
-    // Half the menu-bar height plus an eight-point gap.
-    let y = (click.y.round() as i32 + (20.0 * scale).round() as i32).clamp(min_y, max_y);
-
-    if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
-        tracing::warn!(
-            target: "main",
-            error = %err,
-            "Failed to position main popup at tray click"
-        );
-    }
 }
 
 /// Show or create the main window (positioned at bottom right)
@@ -1440,7 +1521,12 @@ fn update_dock_on_window_close(window: &WebviewWindow) {
 
 /// Internal function to show or create the main window at a specific position
 fn show_main_window_at_position(app: &AppHandle, position: Position) {
+    prepare_main_window(app, position, true);
+}
+
+fn prepare_main_window(app: &AppHandle, position: Position, show: bool) {
     if let Some(window) = app.get_webview_window("main_popup") {
+        if !show { return; }
         move_window_safely(&window, position, "main_popup");
         let _ = window.show();
         let _ = window.unminimize();
@@ -1493,6 +1579,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                 }
                 #[cfg(target_os = "macos")]
                 tauri::WindowEvent::Focused(false) => {
+                    if monotonic_popup_time_ms() < SUPPRESS_MAIN_POPUP_FOCUS_LOSS_UNTIL_MS.load(Ordering::Relaxed) { return; }
                     record_main_popup_focus_loss();
                     let _ = window_for_events.hide();
                     crate::schedule_update_dock_visibility(&window_for_events.app_handle().clone());
@@ -1500,7 +1587,8 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                 _ => {}
             });
 
-            // Show once before positioning so AppKit assigns a monitor.
+            if !show { return; }
+            // Non-click entry points use the positioner's default placement.
             let _ = window.show();
             move_window_safely(&window, position, "main_popup");
             let _ = window.set_focus();
@@ -2278,6 +2366,76 @@ pub struct GeneralSettings {
     pub language: Option<String>,
 }
 
+#[derive(serde::Serialize)]
+pub struct ClockPreferences {
+    pub hour12: Option<bool>,
+    pub system_hour12: Option<bool>,
+}
+
+#[cfg(target_os = "macos")]
+fn clock_pattern_hour12(pattern: &str) -> Option<bool> {
+    let mut literal = false;
+    let mut characters = pattern.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\'' {
+            if characters.peek() == Some(&'\'') { characters.next(); }
+            else { literal = !literal; }
+        } else if !literal {
+            match character {
+                'h' | 'K' => return Some(true),
+                'H' | 'k' => return Some(false),
+                _ => {},
+            }
+        }
+    }
+    None
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod clock_format_tests {
+    use super::clock_pattern_hour12;
+    #[test]
+    fn native_system_clock_exposes_an_hour_cycle() {
+        use objc2_foundation::{NSDateFormatter, NSLocale, NSString};
+        let format = NSDateFormatter::dateFormatFromTemplate_options_locale(
+            &NSString::from_str("j"), 0, Some(&NSLocale::currentLocale()),
+        ).expect("macOS should supply its clock pattern");
+        assert!(clock_pattern_hour12(&format.to_string()).is_some());
+    }
+
+    #[test]
+    fn localized_clock_patterns_ignore_quoted_hour_labels() {
+        assert_eq!(clock_pattern_hour12("HH 'h'"), Some(false));
+        assert_eq!(clock_pattern_hour12("'h' HH:mm"), Some(false));
+        assert_eq!(clock_pattern_hour12("h 'o''clock' a"), Some(true));
+        assert_eq!(clock_pattern_hour12("KK:mm"), Some(true));
+        assert_eq!(clock_pattern_hour12("kk:mm"), Some(false));
+        assert_eq!(clock_pattern_hour12("'hour'"), None);
+    }
+}
+
+#[tauri::command]
+pub fn get_clock_preferences() -> ClockPreferences {
+    #[cfg(target_os = "macos")]
+    let system_hour12 = {
+        use objc2_foundation::{NSDateFormatter, NSLocale};
+        // The native template respects the user's 24-hour override, unlike
+        // choosing a web locale based only on their language or region.
+        NSDateFormatter::dateFormatFromTemplate_options_locale(
+            &NSString::from_str("j"), 0, Some(&NSLocale::currentLocale()),
+        ).and_then(|format| clock_pattern_hour12(&format.to_string()))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let system_hour12 = None;
+    ClockPreferences { hour12: ConfigManager::get().get_config().clock_hour12, system_hour12 }
+}
+
+#[tauri::command]
+pub fn set_clock_hour12(app: AppHandle, hour12: Option<bool>) -> CommandResult<()> {
+    ConfigManager::get().set_clock_hour12(hour12).map_err(|error| error.to_string())?;
+    app.emit("clock-preferences-changed", ()).map_err(|error| error.to_string())
+}
+
 /// Set log to file setting
 #[tauri::command]
 pub async fn set_log_to_file(enabled: bool) -> CommandResult<()> {
@@ -2348,4 +2506,21 @@ pub async fn open_log_folder() -> CommandResult<()> {
     #[cfg(not(windows))]
     showfile::show_path_in_file_manager(log_dir);
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod popup_position_tests {
+    use super::popup_origin;
+
+    #[test]
+    fn uses_screen_points_including_negative_and_vertical_layouts() {
+        assert_eq!(popup_origin(-1000.0, -1920.0, 0.0, 1920.0, 1055.0, 370.0, 530.0), (-1185.0, 517.0));
+        assert_eq!(popup_origin(200.0, 0.0, 900.0, 1440.0, 875.0, 370.0, 530.0), (15.0, 1237.0));
+        assert_eq!(popup_origin(1900.0, 0.0, 0.0, 1920.0, 1055.0, 370.0, 530.0), (1550.0, 517.0));
+    }
+
+    #[test]
+    fn a_small_screen_does_not_panic() {
+        assert_eq!(popup_origin(20.0, 0.0, 0.0, 300.0, 400.0, 370.0, 530.0), (0.0, 0.0));
+    }
 }

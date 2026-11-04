@@ -1,0 +1,18 @@
+<!doctype html>
+<html><head><meta charset="UTF-8"><title>Cloudreve macOS onboarding QA</title><style>
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; }
+  #root { flex: 1; min-height: 0; overflow: auto; position: relative; }
+  #root > .MuiBox-root { position: absolute; inset: 0; height: auto; min-height: 0; }
+  #root > .MuiBox-root > .MuiBox-root { height: 100%; }
+</style></head>
+<body>
+  <div style="flex-shrink:0;background:#fff4cf;padding:8px;font:12px system-ui;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+    <strong>Simulated macOS QA</strong>
+    <label><input id="approve" type="checkbox"> Approve native access</label>
+    <select id="health"><option value="checking">Checking</option><option value="applying">Checking folder contents</option><option value="offline">Offline</option><option value="retrying">Retrying</option><option value="completed">Completed</option></select>
+    <select id="progress-case"><option value="single">One drive</option><option value="mixed">Mixed drives</option><option value="discovered">New folders found</option><option value="large">3,000 folders</option></select>
+    <a href="#/add-drive">Onboarding</a><a href="#/popup">Activity</a>
+  </div>
+  <div id="root"></div>
+  <script type="module" src="./macos.js"></script>
+</body></html>

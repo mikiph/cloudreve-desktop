@@ -18,6 +18,7 @@ import {
 import {
   CloudDownload as DownloadIcon,
   CloudUpload as UploadIcon,
+  DeleteOutline as DeleteIcon,
   Folder as FolderIcon,
   InsertDriveFile as FileIcon,
   WarningAmber as WarningIcon,
@@ -78,7 +79,7 @@ export default function FileProviderIssueItem({
   };
 
   const ItemIcon = issue.is_folder ? FolderIcon : FileIcon;
-  const OperationIcon = issue.operation === "upload" ? UploadIcon : DownloadIcon;
+  const OperationIcon = issue.operation === "delete" ? DeleteIcon : issue.operation === "upload" ? UploadIcon : DownloadIcon;
   const busy = resolvingAction !== null;
 
   return (
@@ -174,7 +175,7 @@ export default function FileProviderIssueItem({
                     disabled={busy}
                     onClick={() => handleResolve("retry")}
                   >
-                    {resolvingAction === "retry" ? "Retrying…" : `Retry ${issue.operation}`}
+                    {resolvingAction === "retry" ? "Retrying…" : `Retry ${issue.operation === "delete" ? "deletion" : issue.operation}`}
                   </Button>
                   {isManagedConflict && (
                     <Button

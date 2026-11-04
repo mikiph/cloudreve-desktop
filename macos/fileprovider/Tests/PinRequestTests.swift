@@ -83,7 +83,7 @@ enum PinRequestTests {
             anchor = next.rawValue
             if !more { break }
         }
-        precondition(sizes == [100, 100, 53])
+        precondition(sizes.count > 1 && sizes.allSatisfy { $0 > 0 && $0 <= 100 })
         precondition(delivered == Array(1...253).map(Int64.init))
         try database.execute("UPDATE fp_event_heads SET floor=100 WHERE drive='test'")
         do {

@@ -197,6 +197,10 @@ pub struct Mount {
     remote_event_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     #[cfg(target_os = "macos")]
     pub(crate) fileprovider_audit_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    #[cfg(target_os = "macos")]
+    pub(crate) fileprovider_recovery_pending: std::sync::atomic::AtomicBool,
+    #[cfg(target_os = "macos")]
+    pub(crate) fileprovider_full_recovery_requested: std::sync::atomic::AtomicBool,
     initial_sync_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
     fs_watcher: Mutex<Option<FsWatcher>>,
@@ -324,6 +328,10 @@ impl Mount {
             remote_event_handle: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(target_os = "macos")]
             fileprovider_audit_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            fileprovider_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            fileprovider_full_recovery_requested: std::sync::atomic::AtomicBool::new(false),
             initial_sync_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cr_client: cr_client_arc,
             inventory,

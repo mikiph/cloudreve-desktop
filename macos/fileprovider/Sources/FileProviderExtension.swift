@@ -490,6 +490,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             do {
                 let parentURI = store.uri(for: itemTemplate.parentItemIdentifier)
                 let uri = parentURI + "/" + itemTemplate.filename
+                guard try !FileProviderDeleteIntentStore.containsURI(driveID: store.drive.id, uri: uri) else {
+                    throw CloudreveError.noSuchItem
+                }
                 let isFolder = itemTemplate.contentType?.conforms(to: .folder) ?? false
                 let deleteGeneration = store.remoteDeleteGeneration(for: uri)
 
@@ -557,7 +560,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 }
 
                 // Do not recreate an item deleted during upload.
-                if store.remoteDeleteOccurred(for: uri, after: deleteGeneration) {
+                if try FileProviderDeleteIntentStore.containsURI(driveID: store.drive.id, uri: uri)
+                    || store.remoteDeleteOccurred(for: uri, after: deleteGeneration) {
                     try? await store.client.deleteFile(uri: uri)
                     let remoteIdentifier = store.identifier(forURI: uri)
                     store.evictCachedItems(withIdentifiers: [
@@ -636,6 +640,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             do {
                 var uri = store.uri(for: item.itemIdentifier)
                 let originalURI = uri
+                guard try !FileProviderDeleteIntentStore.containsURI(driveID: store.drive.id, uri: uri) else {
+                    throw CloudreveError.noSuchItem
+                }
                 let deleteGeneration = store.remoteDeleteGeneration(for: originalURI)
                 var pending = changedFields
                 pending.remove(.lastUsedDate)
@@ -747,7 +754,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     pending.remove(.parentItemIdentifier)
                 }
 
-                if store.remoteDeleteOccurred(
+                if try FileProviderDeleteIntentStore.containsURI(driveID: store.drive.id, uri: originalURI)
+                    || store.remoteDeleteOccurred(
                     for: originalURI, after: deleteGeneration)
                 {
                     try? await store.client.deleteFile(uri: uri)
@@ -822,11 +830,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
         Task {
             do {
+                try FileProviderDeleteIntentStore.begin(driveID: store.drive.id,
+                    identifier: identifier.rawValue, uri: store.uri(for: identifier))
+                store.recordRemoteDelete(for: store.uri(for: identifier))
+                try await store.client.cancelOwnedUploads(under: store.uri(for: identifier))
                 try await store.client.deleteFile(uri: store.uri(for: identifier))
+                try FileProviderDeleteIntentStore.finish(driveID: store.drive.id, identifier: identifier.rawValue)
                 store.evictCachedItems(withIdentifiers: [identifier])
                 logger.notice("deleted \(identifier.rawValue, privacy: .public)")
                 completionHandler(nil)
             } catch CloudreveError.noSuchItem {
+                try? FileProviderDeleteIntentStore.finish(driveID: store.drive.id, identifier: identifier.rawValue)
                 // Treat an already-removed item as deleted.
                 store.evictCachedItems(withIdentifiers: [identifier])
                 logger.notice(

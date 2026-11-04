@@ -270,6 +270,8 @@ impl DriveManager {
             .spawn_remote_event_processor(mount_arc.clone())
             .await;
         mount_arc.spawn_props_refresh_task().await;
+        #[cfg(target_os = "macos")]
+        mount_arc.schedule_fileprovider_recovery().await;
         #[cfg(any(target_os = "macos", windows))]
         mount_arc.spawn_share_poll_task().await;
 
@@ -717,7 +719,20 @@ impl DriveManager {
         finished_tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         finished_tasks.truncate(25);
 
+        #[cfg(target_os = "macos")]
+        let mut sync_health = Vec::new();
+        #[cfg(target_os = "macos")]
+        for mount in read_guard.values().filter(|mount| drive_id.map_or(true, |id| mount.id == id)) {
+            let flags = mount.get_status_flags().await;
+            sync_health.push(SyncHealth {
+                drive_id: mount.id.clone(),
+                connected: flags.is_event_push_subscribed() && !flags.is_credential_expired(),
+                recovery: crate::fileprovider::read_recovery_status(&mount.id)?,
+            });
+        }
         Ok(StatusSummary {
+            #[cfg(target_os = "macos")]
+            sync_health,
             drives,
             active_tasks,
             finished_tasks,

@@ -38,6 +38,23 @@ impl InventoryDb {
             .context("Failed to read File Provider recovery inventory")
     }
 
+    /// Indexed lookup of just one changed page, never load the entire drive.
+    pub fn fileprovider_remote_items_by_ids(&self, drive: &str, ids: &[String]) -> Result<Vec<FileProviderRemoteItem>> {
+        let mut conn = self.connection()?;
+        Ok(fileprovider_remote_items::table
+            .filter(fileprovider_remote_items::drive_id.eq(drive))
+            .filter(fileprovider_remote_items::remote_id.eq_any(ids))
+            .select(FileProviderRemoteItem::as_select()).load(&mut conn)?)
+    }
+
+    pub fn fileprovider_oldest_observation(&self, drive: &str) -> Result<Option<i64>> {
+        let mut conn = self.connection()?;
+        Ok(fileprovider_remote_items::table
+            .filter(fileprovider_remote_items::drive_id.eq(drive))
+            .select(diesel::dsl::min(fileprovider_remote_items::seen_generation))
+            .first(&mut conn)?)
+    }
+
     pub fn upsert_fileprovider_remote_items(
         &self,
         items: &[NewFileProviderRemoteItem],
@@ -182,6 +199,26 @@ mod tests {
             version: format!("v{generation}"),
             seen_generation: generation,
         }
+    }
+
+    #[test]
+    fn incremental_page_preserves_unreturned_items_and_scopes_id_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let inventory = InventoryDb::with_path(temp.path().join("inventory.db")).unwrap();
+        let mut other = row("changed", 1);
+        other.drive_id = "other-drive".into();
+        inventory.upsert_fileprovider_remote_items(&[row("changed", 1), row("unchanged", 1)]).unwrap();
+        inventory.upsert_fileprovider_remote_items(&[other]).unwrap();
+        let event = crate::fileprovider::FpEventRecord { ts: 0, event_type: "modify".into(),
+            from: "cloudreve://my/changed".into(), to: String::new(), local_echo: false };
+        inventory.upsert_fileprovider_remote_items_with_events(&[row("changed", 2)], &[event]).unwrap();
+        let selected = inventory.fileprovider_remote_items_by_ids("drive", &["changed".into()]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].version, "v2");
+        assert_eq!(inventory.fileprovider_remote_items("drive").unwrap().len(), 2);
+        assert_eq!(inventory.fileprovider_oldest_observation("drive").unwrap(), Some(1));
+        assert_eq!(inventory.fileprovider_oldest_observation("new-drive").unwrap(), None);
+        assert!(inventory.fileprovider_remote_items_by_ids("drive", &[]).unwrap().is_empty());
     }
 
     #[test]

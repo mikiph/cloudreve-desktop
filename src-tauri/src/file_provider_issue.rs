@@ -50,6 +50,17 @@ pub fn list(known_drive_ids: &HashSet<String>) -> Result<Vec<FileProviderIssue>>
         .filter(|record| record.key.ends_with(".json"))
         .map(|record| serde_json::from_str::<PendingSnapshot>(&record.payload))
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let delete_intents = cloudreve_sync::fileprovider_db::StateDb::open()?
+        .records("fileprovider-delete-intents")?
+        .into_iter().map(|record| record.key).collect::<HashSet<_>>();
+    let mut snapshots = snapshots;
+    for snapshot in &mut snapshots {
+        for item in &mut snapshot.items {
+            if delete_intents.contains(&format!("{}:{}", snapshot.drive_id, item.item_identifier)) {
+                item.operation = "delete".into();
+            }
+        }
+    }
     let conflicts = crate::upload_conflict::list()?;
     Ok(merge(snapshots, conflicts, known_drive_ids))
 }
@@ -99,6 +110,10 @@ fn merge(
             continue;
         }
         let key = (conflict.drive_id.clone(), conflict.item_identifier.clone());
+        // A local deletion supersedes stale upload recovery actions.
+        if issues.get(&key).is_some_and(|issue| issue.operation == "delete") {
+            continue;
+        }
         if conflict.action.is_some() {
             issues.remove(&key);
             continue;
@@ -189,6 +204,22 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].source, "upload_conflict");
         assert_eq!(issues[0].application.as_deref(), Some("OnlyOffice"));
+    }
+
+    #[test]
+    fn deletion_supersedes_upload_conflicts_and_their_retry_actions() {
+        for action in [None, Some("retry".to_string()), Some("discard".to_string())] {
+            let mut snapshot = pending_snapshot();
+            snapshot.items[0].operation = "delete".into();
+            let mut upload = conflict();
+            upload.action = action;
+            let known = HashSet::from(["drive-1".to_string()]);
+            let issues = merge(vec![snapshot], vec![upload], &known);
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0].operation, "delete");
+            assert_eq!(issues[0].source, "pending");
+            assert!(issues[0].conflict_id.is_none());
+        }
     }
 
     #[test]

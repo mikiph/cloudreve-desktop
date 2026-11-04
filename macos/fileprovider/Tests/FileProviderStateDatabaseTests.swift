@@ -30,6 +30,20 @@ enum FileProviderStateDatabaseTests {
         let snapshot = try db.eventSnapshot(drive: "drive", since: 200)
         precondition(snapshot.latest == 300 && snapshot.floor == 100)
         precondition(snapshot.events == [Data("third".utf8)])
+        let firstPage = try db.eventSnapshot(drive: "drive", since: 100, limit: 1)
+        precondition(firstPage.events == [Data("second".utf8)])
+        precondition(firstPage.hasMore && firstPage.readThrough == 200)
+        let lastPage = try db.eventSnapshot(drive: "drive", since: firstPage.readThrough, limit: 1)
+        precondition(lastPage.events == [Data("third".utf8)])
+        precondition(!lastPage.hasMore && lastPage.readThrough == 300)
+        try db.execute("INSERT INTO fp_events VALUES('drive',400,'{\"type\":\"rescan\"}')")
+        try db.execute("UPDATE fp_event_heads SET latest=400 WHERE drive='drive'")
+        let resetBeyondPage = try db.eventSnapshot(drive: "drive", since: 100, limit: 1)
+        precondition(resetBeyondPage.events.count == 1 && resetBeyondPage.hasRescan,
+            "A reset beyond a bounded page must still expire stale anchors")
+        let plan = try db.rows("EXPLAIN QUERY PLAN SELECT 1 FROM fp_events WHERE drive=? AND sequence>? AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.type') END='rescan' LIMIT 1", ["drive", "100"])
+        precondition(plan.contains { $0.joined().contains("idx_fp_events_rescan") },
+            "Reset detection must use the index rather than scan every metadata payload")
         do {
             _ = try db.eventSnapshot(drive: "missing", since: 0)
             preconditionFailure("An uninitialized journal must not look empty")

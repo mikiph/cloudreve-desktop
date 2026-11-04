@@ -11,6 +11,8 @@ pub struct DriveState {
 /// Summary of the current status including drives and recent tasks
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSummary {
+    #[cfg(target_os = "macos")]
+    pub sync_health: Vec<SyncHealth>,
     /// All configured drives (unfiltered)
     pub drives: Vec<DriveConfig>,
     /// Active tasks (pending/running) with optional live progress info
@@ -172,4 +174,12 @@ pub fn format_bytes(bytes: i64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncHealth {
+    pub drive_id: String,
+    pub connected: bool,
+    pub recovery: Option<crate::fileprovider::RecoveryStatus>,
 }

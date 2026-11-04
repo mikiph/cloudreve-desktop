@@ -49,6 +49,11 @@ export interface PendingConflict {
 }
 
 export interface StatusSummary {
+  sync_health?: {
+    drive_id: string;
+    connected: boolean;
+    recovery?: { phase: "checking" | "applying" | "retrying" | "completed"; items_checked: number; folders_checked: number; updated_at: number; last_completed_at?: number; target_sequence?: number; folder_progress?: { completed: number; total: number; remaining: number; pages_checked: number; items_checked: number; retrying: number }; error?: string };
+  }[];
   drives: DriveConfig[];
   active_tasks: TaskWithProgress[];
   finished_tasks: TaskRecord[];
@@ -62,7 +67,7 @@ export interface FileProviderIssue {
   item_identifier: string;
   filename: string;
   is_folder: boolean;
-  operation: "upload" | "download";
+  operation: "upload" | "download" | "delete";
   source: "pending" | "upload_conflict";
   kind?: "locked" | "stale" | "unverified";
   application?: string;
