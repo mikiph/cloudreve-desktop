@@ -246,6 +246,7 @@ enum CloudreveError: Error, LocalizedError {
 private final class CredentialBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Credentials
+    private var rejected: String?
     init(_ value: Credentials) { self.value = value }
     func get() -> Credentials { lock.lock(); defer { lock.unlock() }; return value }
     func set(_ new: Credentials) { lock.lock(); value = new; lock.unlock() }
@@ -253,8 +254,13 @@ private final class CredentialBox: @unchecked Sendable {
     /// so a request that failed with an old token cannot wipe a newer one.
     func invalidate(ifAccessToken token: String) {
         lock.lock(); defer { lock.unlock() }
-        if value.access_token == token { value.access_token = nil }
+        if value.access_token == token {
+            value.access_token = nil
+            rejected = token
+        }
     }
+    /// The most recently rejected access token; it must never be re-adopted.
+    func rejectedToken() -> String? { lock.lock(); defer { lock.unlock() }; return rejected }
 }
 
 /// Maps Cloudreve API error codes to typed errors.
@@ -359,7 +365,7 @@ final class CloudreveClient {
             // processes don't fight over refresh-token rotation.
             if let reloaded = reloadCredentials() {
                 if Self.isValid(reloaded), let token = reloaded.access_token,
-                    token != current.access_token
+                    token != current.access_token, token != credentials.rejectedToken()
                 {
                     credentials.set(reloaded)
                     return token

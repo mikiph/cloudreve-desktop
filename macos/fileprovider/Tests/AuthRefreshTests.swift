@@ -107,6 +107,12 @@ private final class AuthProtocol: URLProtocol {
         if case .notAuthenticated = mapApiError(code: 401, message: nil) {} else {
             preconditionFailure("401 must map to notAuthenticated")
         }
+        // 6. A reloaded token the server already rejected is not re-adopted.
+        AuthProtocol.reset()
+        client = makeClient(oldCreds, reloader: { oldCreds })
+        _ = try await client.fileInfo(uri: uri)
+        precondition(AuthProtocol.refreshCount == 1)
+
         print("AuthRefreshTests: all tests passed")
     }
 }
