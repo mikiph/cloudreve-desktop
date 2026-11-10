@@ -23,6 +23,9 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 32;
 const EVENT_STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
+const HEALTHY_STREAM_SECS: u64 = 60;
+#[cfg(target_os = "macos")]
+const EVENT_BATCH_COMMIT_ATTEMPTS: u32 = 5;
 #[cfg(target_os = "macos")]
 const EVENT_VERIFY_CONCURRENCY: usize = 8;
 #[cfg(target_os = "macos")]
@@ -46,6 +49,20 @@ fn is_path_missing(error: &cloudreve_api::ApiError) -> bool {
         error,
         cloudreve_api::ApiError::ApiError { code, .. } if *code == 40016 || *code == 404
     )
+}
+
+/// A stream that stayed up for a while starts a fresh retry sequence; a
+/// stream that ended quickly keeps backing off. Every resubscribe waits.
+fn reconnect_delay(backoff: &mut BackoffState, connected_for: Duration) -> Duration {
+    if connected_for >= Duration::from_secs(HEALTHY_STREAM_SECS) {
+        backoff.reset();
+    }
+    backoff.next_delay()
+}
+
+#[cfg(target_os = "macos")]
+fn should_retry_batch(attempt: u32) -> bool {
+    attempt < EVENT_BATCH_COMMIT_ATTEMPTS
 }
 
 struct BackoffState {
@@ -90,17 +107,18 @@ impl Mount {
         let mut backoff = BackoffState::new();
 
         loop {
+            let started = std::time::Instant::now();
             let result = s.listen_remote_events().await;
             match result {
                 ListenResult::ReconnectRequired => {
-                    tracing::info!(target: "drive::remote_events", "Reconnect required, re-subscribing immediately");
-                    backoff.reset();
-                    continue;
+                    let delay = reconnect_delay(&mut backoff, started.elapsed());
+                    tracing::info!(target: "drive::remote_events", delay_secs = delay.as_secs(), "Reconnect required, re-subscribing after delay");
+                    tokio::time::sleep(delay).await;
                 }
                 ListenResult::StreamEnded => {
-                    tracing::warn!(target: "drive::remote_events", "Event stream ended unexpectedly, reconnecting");
-                    backoff.reset();
-                    continue;
+                    let delay = reconnect_delay(&mut backoff, started.elapsed());
+                    tracing::warn!(target: "drive::remote_events", delay_secs = delay.as_secs(), "Event stream ended unexpectedly, reconnecting after delay");
+                    tokio::time::sleep(delay).await;
                 }
                 ListenResult::Error {
                     error: e,
@@ -179,12 +197,24 @@ impl Mount {
                         #[cfg(target_os = "macos")]
                         {
                             let mut retry = BackoffState::new();
+                            let mut attempt = 0u32;
                             loop {
+                                attempt += 1;
                                 match self.handle_file_events(sync_path.clone(), events.clone()).await {
                                     Ok(()) => break,
-                                    Err(error) => {
-                                        tracing::warn!(target: "drive::remote_events", %error, "Retrying uncommitted File Provider events");
+                                    Err(error) if should_retry_batch(attempt) => {
+                                        tracing::warn!(target: "drive::remote_events", %error, attempt, "Retrying uncommitted File Provider events");
                                         tokio::time::sleep(retry.next_delay()).await;
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(target: "drive::remote_events", %error, attempts = EVENT_BATCH_COMMIT_ATTEMPTS, "Abandoning File Provider event batch; reconnecting to recover");
+                                        let drive_id_for_marker = self.config.read().await.id.clone();
+                                        let _ = crate::fileprovider::append_rescan_marker(&drive_id_for_marker);
+                                        self.set_event_push_subscribed(false).await;
+                                        return ListenResult::Error {
+                                            error: error.context("File Provider events could not be committed"),
+                                            was_connected,
+                                        };
                                     }
                                 }
                             }
@@ -369,20 +399,23 @@ impl Mount {
                 }
             }
 
-            if needs_rescan {
-                crate::fileprovider::append_rescan_marker(&drive_id)?;
+            let marker = if needs_rescan {
+                Some("rescan")
             } else if needs_presented_refresh {
-                crate::fileprovider::append_presented_refresh(&drive_id)?;
-            }
+                Some("refresh_presented")
+            } else {
+                None
+            };
             let events_to_log: Vec<FileEventData> =
                 verified_events.iter().map(|e| (*e).clone()).collect();
+            crate::fileprovider::append_domain_events_with_marker(
+                &drive_id,
+                marker,
+                &events_to_log,
+                &local_upload_echo_paths,
+                &upload_receipts,
+            )?;
             if !events_to_log.is_empty() {
-                crate::fileprovider::append_domain_events(
-                    &drive_id,
-                    &events_to_log,
-                    &local_upload_echo_paths,
-                    &upload_receipts,
-                )?;
                 {
                     for event in &events_to_log {
                         tracing::info!(
@@ -811,6 +844,28 @@ impl Mount {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_delay_backs_off_for_short_lived_streams() {
+        let mut backoff = BackoffState::new();
+        let short = Duration::from_secs(1);
+        let delays = (0..3).map(|_| reconnect_delay(&mut backoff, short).as_secs()).collect::<Vec<_>>();
+        assert_eq!(delays, [1, 2, 4]);
+    }
+
+    #[test]
+    fn reconnect_delay_resets_after_a_healthy_stream() {
+        let mut backoff = BackoffState::new();
+        reconnect_delay(&mut backoff, Duration::from_secs(1));
+        reconnect_delay(&mut backoff, Duration::from_secs(1));
+        assert_eq!(reconnect_delay(&mut backoff, Duration::from_secs(61)).as_secs(), 1);
+    }
+
+    #[test]
+    fn batch_retries_are_bounded() {
+        assert!((1..EVENT_BATCH_COMMIT_ATTEMPTS).all(should_retry_batch));
+        assert!(!should_retry_batch(EVENT_BATCH_COMMIT_ATTEMPTS));
+    }
 
     fn api_error(code: i32) -> cloudreve_api::ApiError {
         cloudreve_api::ApiError::ApiError {
