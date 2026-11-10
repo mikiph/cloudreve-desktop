@@ -40,6 +40,23 @@ const DOMAIN_PREFIX: &str = "cloudreve.drive.";
 const DOWNLOAD_RETRY_DIRECTORY: &str = "fileprovider-download-retries";
 const ACTIVITY_DIRECTORY: &str = "fileprovider-activity";
 const UPLOAD_RECEIPT_DIRECTORY: &str = "fileprovider-upload-receipts";
+const FINDER_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// removeDomain preserves dirty user data and can take longer.
+const DOMAIN_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wait for an NSFileProviderManager completion block. A daemon that never
+/// calls back must not hold DOMAIN_OPERATIONS or a UI request forever.
+async fn await_completion<T>(
+    rx: oneshot::Receiver<Result<T>>,
+    limit: Duration,
+    what: &str,
+) -> Result<T> {
+    match tokio::time::timeout(limit, rx).await {
+        Err(_) => Err(anyhow!("Finder did not respond to {what} within {} seconds. Try again; nothing was changed by Cloudreve.", limit.as_secs())),
+        Ok(Err(_)) => Err(anyhow!("{what} callback dropped")),
+        Ok(Ok(result)) => result,
+    }
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct FileProviderActivityRecord {
@@ -512,8 +529,7 @@ async fn signal_error_resolved(
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("File Provider resolution callback dropped"))?
+    await_completion(rx, FINDER_CALL_TIMEOUT, "the error resolution").await
 }
 
 /// Resume File Provider operations paused with CannotSynchronize.
@@ -595,8 +611,7 @@ pub async fn retry_item_upload(
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("File Provider upload retry callback dropped"))?
+    await_completion(rx, FINDER_CALL_TIMEOUT, "the upload retry").await
 }
 
 /// Ask File Provider to retry downloading one item.
@@ -639,8 +654,7 @@ pub async fn retry_item_download(
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("File Provider download retry callback dropped"))?
+    await_completion(rx, FINDER_CALL_TIMEOUT, "the download retry").await
 }
 
 /// Refresh shared metadata in the replicated working set.
@@ -1028,8 +1042,7 @@ pub async fn add_domain(domain_id: &str, display_name: &str) -> Result<()> {
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("addDomain callback dropped"))?
+    await_completion(rx, DOMAIN_LIFECYCLE_TIMEOUT, "adding the Finder location").await
 }
 
 /// Remove a domain. WARNING: this deletes the local replica of the domain
@@ -1067,8 +1080,7 @@ pub async fn remove_domain(domain_id: &str, display_name: &str) -> Result<Option
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("removeDomain callback dropped"))?
+    await_completion(rx, DOMAIN_LIFECYCLE_TIMEOUT, "removing the Finder location").await
 }
 
 /// Tell macOS whether the host application is available for a registered
@@ -1380,6 +1392,32 @@ mod recovery_status_tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completion_wait_times_out_when_finder_never_answers() {
+        let (_tx, rx) = oneshot::channel::<Result<()>>();
+        let error = await_completion(rx, Duration::from_millis(50), "test").await.unwrap_err();
+        assert!(error.to_string().contains("did not respond"));
+    }
+
+    #[tokio::test]
+    async fn completion_wait_reports_a_dropped_callback() {
+        let (tx, rx) = oneshot::channel::<Result<()>>();
+        drop(tx);
+        let error = await_completion(rx, Duration::from_secs(1), "test").await.unwrap_err();
+        assert!(error.to_string().contains("callback dropped"));
+    }
+
+    #[tokio::test]
+    async fn completion_wait_passes_through_the_result() {
+        let (tx, rx) = oneshot::channel::<Result<()>>();
+        tx.send(Ok(())).unwrap();
+        assert!(await_completion(rx, Duration::from_secs(1), "test").await.is_ok());
+        let (tx, rx) = oneshot::channel::<Result<()>>();
+        tx.send(Err(anyhow!("native"))).unwrap();
+        let error = await_completion(rx, Duration::from_secs(1), "test").await.unwrap_err();
+        assert_eq!(error.to_string(), "native");
+    }
 
     #[test]
     fn only_a_native_name_collision_allows_the_safe_suffix_fallback() {
