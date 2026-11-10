@@ -242,12 +242,27 @@ enum CloudreveError: Error, LocalizedError {
     }
 }
 
+/// Thread-safe holder for the in-memory credentials. The lock is never held across an await.
+private final class CredentialBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Credentials
+    init(_ value: Credentials) { self.value = value }
+    func get() -> Credentials { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ new: Credentials) { lock.lock(); value = new; lock.unlock() }
+    /// Clears the access token only if it is still `token` (compare-and-invalidate),
+    /// so a request that failed with an old token cannot wipe a newer one.
+    func invalidate(ifAccessToken token: String) {
+        lock.lock(); defer { lock.unlock() }
+        if value.access_token == token { value.access_token = nil }
+    }
+}
+
 /// Maps Cloudreve API error codes to typed errors.
 func mapApiError(code: Int, message: String?, responseData: Data? = nil) -> CloudreveError {
     switch code {
     case 40004: return .nameCollision  // ObjectExisted
     case 40016, 40077, 40081: return .noSuchItem  // Entity/parent/target does not exist
-    case 40020, 40089: return .notAuthenticated  // CredentialInvalid / SessionExpired
+    case 401, 40020, 40089: return .notAuthenticated  // CredentialInvalid / SessionExpired
     case 40073:
         let detail = responseData.flatMap {
             try? JSONDecoder().decode(LockConflictEnvelope.self, from: $0)
@@ -271,27 +286,23 @@ final class CloudreveClient {
 
     let baseURL: URL
     private let driveID: String
-    private var credentials: Credentials
+    private let credentials: CredentialBox
+    /// Re-reads the host's persisted credentials (drives.json).
+    private let reloadCredentials: @Sendable () -> Credentials?
     /// Deduplicates concurrent token refreshes.
     private let refreshCoordinator = RefreshCoordinator()
 
     /// Configuration for the per-download delegate session (the injected session's, in tests).
     private let downloadConfiguration: URLSessionConfiguration
 
-    private lazy var session: URLSession = {
+    private let session: URLSession
+
+    private static func makeDefaultSession() -> URLSession {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 600
         return URLSession(configuration: config)
-    }()
-
-    /// Session for the long-lived SSE events stream (no timeouts).
-    private(set) lazy var eventsSession: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = .infinity
-        config.timeoutIntervalForResource = .infinity
-        return URLSession(configuration: config)
-    }()
+    }
 
     private static let rfc3339: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -308,35 +319,57 @@ final class CloudreveClient {
         return f.date(from: s)
     }
 
-    init(drive: DriveConfig, session: URLSession? = nil) {
+    init(
+        drive: DriveConfig, session: URLSession? = nil,
+        credentialReloader: (@Sendable () -> Credentials?)? = nil
+    ) {
         self.driveID = drive.id
         self.baseURL = URL(string: drive.instance_url)!
-        self.credentials = drive.credentials
+        self.credentials = CredentialBox(drive.credentials)
+        let id = drive.id
+        self.reloadCredentials =
+            credentialReloader ?? { DriveStore.loadDrive(driveID: id)?.credentials }
         self.downloadConfiguration = session?.configuration ?? .default
-        if let session { self.session = session }
+        self.session = session ?? Self.makeDefaultSession()
     }
 
     // MARK: Tokens
 
-    private func accessTokenValid() -> Bool {
-        guard let token = credentials.access_token, !token.isEmpty,
-            let expires = Self.parseDate(credentials.access_expires)
+    private static func isValid(_ c: Credentials) -> Bool {
+        guard let token = c.access_token, !token.isEmpty,
+            let expires = parseDate(c.access_expires)
         else { return false }
         return expires.timeIntervalSinceNow > 30
     }
 
     /// Returns a usable access token, refreshing in memory if needed.
     func validAccessToken() async throws -> String {
-        if accessTokenValid(), let token = credentials.access_token {
+        let snapshot = credentials.get()
+        if Self.isValid(snapshot), let token = snapshot.access_token {
             return token
         }
         return try await refreshCoordinator.coordinate { [self] in
             // Re-check: another task may have refreshed while we waited.
-            if accessTokenValid(), let token = credentials.access_token {
+            let current = credentials.get()
+            if Self.isValid(current), let token = current.access_token {
                 return token
             }
+            // The host persists rotated tokens to drives.json (mounts.rs
+            // RefreshCredentials -> PersistConfig). Prefer them so the two
+            // processes don't fight over refresh-token rotation.
+            if let reloaded = reloadCredentials() {
+                if Self.isValid(reloaded), let token = reloaded.access_token,
+                    token != current.access_token
+                {
+                    credentials.set(reloaded)
+                    return token
+                }
+                if reloaded.refresh_token != current.refresh_token {
+                    credentials.set(reloaded)
+                }
+            }
             try await performRefresh()
-            guard let token = credentials.access_token else {
+            guard let token = credentials.get().access_token else {
                 throw CloudreveError.notAuthenticated
             }
             return token
@@ -349,7 +382,7 @@ final class CloudreveClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(
-            ["refresh_token": credentials.refresh_token])
+            ["refresh_token": credentials.get().refresh_token])
 
         logger.notice("refreshing access token")
         let (data, response) = try await session.data(for: request)
@@ -365,14 +398,18 @@ final class CloudreveClient {
             logger.error("token refresh rejected: \(envelope.msg ?? "?", privacy: .public)")
             throw CloudreveError.notAuthenticated
         }
-        credentials.access_token = token.access_token
-        credentials.refresh_token = token.refresh_token
-        credentials.access_expires = token.access_expires
-        credentials.refresh_expires = token.refresh_expires
+        credentials.set(
+            Credentials(
+                access_token: token.access_token,
+                refresh_token: token.refresh_token,
+                access_expires: token.access_expires,
+                refresh_expires: token.refresh_expires))
         logger.notice("access token refreshed")
     }
 
     // MARK: Request plumbing
+
+    private static let authCodes: Set<Int> = [401, 40020, 40089]
 
     /// Performs an authenticated API call and unwraps the envelope.
     /// Retries once after a forced token refresh on 401.
@@ -380,14 +417,18 @@ final class CloudreveClient {
         _ method: String, _ path: String, body: Req?, query: [URLQueryItem] = [],
         retryOnAuthError: Bool = true
     ) async throws -> Res {
-        let (data, status) = try await rawRequest(method, path, body: body, query: query)
-        if status == 401 && retryOnAuthError {
-            credentials.access_token = nil  // force refresh
+        let (data, status, usedToken) = try await rawRequest(
+            method, path, body: body, query: query)
+        let base: BaseEnvelope? =
+            status == 401 ? nil : try JSONDecoder().decode(BaseEnvelope.self, from: data)
+        if status == 401 || Self.authCodes.contains(base?.code ?? 0) {
+            guard retryOnAuthError else { throw CloudreveError.notAuthenticated }
+            credentials.invalidate(ifAccessToken: usedToken)
             return try await self.call(
                 method, path, body: body, query: query,
                 retryOnAuthError: false)
         }
-        let base = try JSONDecoder().decode(BaseEnvelope.self, from: data)
+        guard let base else { throw CloudreveError.badResponse("missing envelope") }
         guard base.code == 0 else {
             throw mapApiError(code: base.code, message: base.msg, responseData: data)
         }
@@ -401,15 +442,15 @@ final class CloudreveClient {
     /// Shared HTTP plumbing: request, returns raw response body and status.
     private func rawRequest<Req: Encodable>(
         _ method: String, _ path: String, body: Req?, query: [URLQueryItem] = []
-    ) async throws -> (Data, Int) {
+    ) async throws -> (Data, Int, String) {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("/api/v4\(path)"), resolvingAgainstBaseURL: false)!
         if !query.isEmpty { components.queryItems = query }
 
         var request = URLRequest(url: components.url!)
         request.httpMethod = method
-        request.setValue(
-            "Bearer \(try await validAccessToken())", forHTTPHeaderField: "Authorization")
+        let token = try await validAccessToken()
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONEncoder().encode(body)
@@ -426,7 +467,7 @@ final class CloudreveClient {
             logger.error("HTTP 404 for \(path, privacy: .public)")
             throw CloudreveError.http(status: 404)
         }
-        return (data, http.statusCode)
+        return (data, http.statusCode, token)
     }
 
     /// Like `call`, for endpoints that return no meaningful payload.
@@ -434,13 +475,17 @@ final class CloudreveClient {
         _ method: String, _ path: String, body: Req?,
         retryOnAuthError: Bool = true
     ) async throws {
-        let (data, status) = try await rawRequest(method, path, body: body, query: [])
-        if status == 401 && retryOnAuthError {
-            credentials.access_token = nil
+        let (data, status, usedToken) = try await rawRequest(
+            method, path, body: body, query: [])
+        let base: BaseEnvelope? =
+            status == 401 ? nil : try JSONDecoder().decode(BaseEnvelope.self, from: data)
+        if status == 401 || Self.authCodes.contains(base?.code ?? 0) {
+            guard retryOnAuthError else { throw CloudreveError.notAuthenticated }
+            credentials.invalidate(ifAccessToken: usedToken)
             return try await self.callVoid(
                 method, path, body: body, retryOnAuthError: false)
         }
-        let base = try JSONDecoder().decode(BaseEnvelope.self, from: data)
+        guard let base else { throw CloudreveError.badResponse("missing envelope") }
         guard base.code == 0 else {
             throw mapApiError(code: base.code, message: base.msg, responseData: data)
         }
