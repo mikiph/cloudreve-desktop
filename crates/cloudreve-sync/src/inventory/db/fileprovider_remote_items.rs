@@ -118,7 +118,7 @@ impl InventoryDb {
                             from: item.uri,
                             to: String::new(),
                             local_echo: false,
-                            file_id: String::new(),
+                            file_id: item.remote_id,
                         })
                         .collect::<Vec<_>>();
                 enqueue_events(tx, drive, &events)?;
@@ -242,6 +242,40 @@ mod tests {
             inventory.fileprovider_remote_items("drive").unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn missing_item_deletion_carries_its_file_id() {
+        use diesel::sql_types::Text;
+        #[derive(QueryableByName)]
+        struct Payload {
+            #[diesel(sql_type = Text)]
+            payload: String,
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let inventory = InventoryDb::with_path(temp.path().join("inventory.db")).unwrap();
+        inventory
+            .upsert_fileprovider_remote_items(&[row("gone", 1), row("kept", 1)])
+            .unwrap();
+        inventory
+            .upsert_fileprovider_remote_items(&[row("kept", 2)])
+            .unwrap();
+        inventory
+            .finish_fileprovider_remote_generation("drive", 2)
+            .unwrap();
+
+        let mut conn = inventory.connection().unwrap();
+        let rows = diesel::sql_query("SELECT payload FROM fileprovider_outbox WHERE drive='drive'")
+            .load::<Payload>(&mut *conn)
+            .unwrap();
+        let events: Vec<crate::fileprovider::FpEventRecord> = rows
+            .iter()
+            .flat_map(|r| serde_json::from_str::<Vec<_>>(&r.payload).unwrap())
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "delete");
+        assert_eq!(events[0].from, "cloudreve://my/gone");
+        assert_eq!(events[0].file_id, "gone");
     }
 
     #[test]
