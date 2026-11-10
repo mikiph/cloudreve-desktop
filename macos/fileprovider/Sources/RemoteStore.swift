@@ -2710,7 +2710,7 @@ final class RemoteStore {
         if let userID = drive.user_id, !userID.isEmpty {
             queryItems.append(URLQueryItem(name: "user_hint", value: userID))
         }
-        components.queryItems = queryItems
+        components.percentEncodedQueryItems = strictlyEncodedQueryItems(queryItems)
         return components.url
     }
 

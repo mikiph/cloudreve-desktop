@@ -991,10 +991,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             var components = URLComponents()
             components.scheme = "cloudreve"
             components.host = "share"
-            components.queryItems = [
+            components.percentEncodedQueryItems = strictlyEncodedQueryItems([
                 URLQueryItem(name: "drive_id", value: store.drive.id),
                 URLQueryItem(name: "uri", value: store.uri(for: identifier)),
-            ]
+            ])
             guard let url = components.url else {
                 completionHandler(
                     NSError(

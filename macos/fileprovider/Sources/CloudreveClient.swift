@@ -263,6 +263,24 @@ private final class CredentialBox: @unchecked Sendable {
     func rejectedToken() -> String? { lock.lock(); defer { lock.unlock() }; return rejected }
 }
 
+/// Characters left unescaped in query names/values: RFC 3986 unreserved only,
+/// matching the Rust client's `urlencoding::encode`. `URLComponents.queryItems`
+/// leaves `+`, `&`-adjacent and other sub-delims alone; servers that use
+/// form decoding (Go, JS URLSearchParams, Rust query_pairs) read `+` as space.
+private let strictQueryAllowed: CharacterSet = {
+    var set = CharacterSet()
+    set.insert(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+    return set
+}()
+
+func strictlyEncodedQueryItems(_ items: [URLQueryItem]) -> [URLQueryItem] {
+    items.map { item in
+        URLQueryItem(
+            name: item.name.addingPercentEncoding(withAllowedCharacters: strictQueryAllowed) ?? item.name,
+            value: item.value?.addingPercentEncoding(withAllowedCharacters: strictQueryAllowed))
+    }
+}
+
 /// Maps Cloudreve API error codes to typed errors.
 func mapApiError(code: Int, message: String?, responseData: Data? = nil) -> CloudreveError {
     switch code {
@@ -451,7 +469,7 @@ final class CloudreveClient {
     ) async throws -> (Data, Int, String) {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("/api/v4\(path)"), resolvingAgainstBaseURL: false)!
-        if !query.isEmpty { components.queryItems = query }
+        if !query.isEmpty { components.percentEncodedQueryItems = strictlyEncodedQueryItems(query) }
 
         var request = URLRequest(url: components.url!)
         request.httpMethod = method
