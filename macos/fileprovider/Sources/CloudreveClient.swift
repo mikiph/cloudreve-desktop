@@ -419,8 +419,12 @@ final class CloudreveClient {
         guard let http = response as? HTTPURLResponse else {
             throw CloudreveError.badResponse("not an HTTP response")
         }
+        // Cloudreve reports missing objects as envelope codes (HTTP 200).
+        // An HTTP 404 is a routing/proxy problem and must not be treated
+        // as a deletion: callers evict identities and pins on noSuchItem.
         if http.statusCode == 404 {
-            throw CloudreveError.noSuchItem
+            logger.error("HTTP 404 for \(path, privacy: .public)")
+            throw CloudreveError.http(status: 404)
         }
         return (data, http.statusCode)
     }
