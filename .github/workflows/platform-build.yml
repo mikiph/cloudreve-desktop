@@ -48,13 +48,9 @@ jobs:
       - name: Test desktop commands
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
-      - name: Test macOS upload encryption
+      - name: Test macOS File Provider suites
         if: runner.os == 'macOS'
-        run: ./macos/scripts/test-upload-encryption.sh
-
-      - name: Test macOS state migration
-        if: runner.os == 'macOS'
-        run: bash macos/scripts/test-state-database.sh
+        run: bash macos/scripts/test-all.sh
 
       - name: Build macOS application bundle
         if: runner.os == 'macOS'

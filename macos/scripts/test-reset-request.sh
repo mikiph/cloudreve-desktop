@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TEST_BINARY="${TMPDIR:-/tmp}/cloudreve-reset-request-tests"
-SDK="${FP_SDK_PATH:-/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk}"
+SDK="${FP_SDK_PATH:-$(xcrun --sdk macosx --show-sdk-path)}"
 MODULE_CACHE="${FP_MODULE_CACHE_PATH:-$ROOT/macos/build/TestModuleCache}"
 mkdir -p "$MODULE_CACHE"
 export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE"
