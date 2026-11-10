@@ -223,6 +223,7 @@ enum CloudreveError: Error, LocalizedError {
     case unsupportedPackage
     case lockConflict(path: String?, application: String?, ownerID: String?)
     case badResponse(String)
+    case unsupportedStoragePolicy(String)
 
     var errorDescription: String? {
         switch self {
@@ -238,6 +239,8 @@ enum CloudreveError: Error, LocalizedError {
                 ? "An unfinished upload is holding this item"
                 : "Someone has this file open online"
         case .badResponse(let detail): return "Bad response: \(detail)"
+        case .unsupportedStoragePolicy(let type):
+            return "This storage policy (\(type)) is not supported by the macOS Finder integration. Upload the file from the Cloudreve website instead."
         }
     }
 }
@@ -785,6 +788,21 @@ final class CloudreveClient {
         let chunk_size: Int64?
         let upload_urls: [String]?
         let encrypt_metadata: UploadEncryptMetadata?
+        let credential: String?
+        let storage_policy: UploadStoragePolicy?
+    }
+
+    private struct UploadStoragePolicy: Decodable { let type: String? }
+
+    /// True when `url` has the same scheme, host and port as the instance.
+    private func isSameOrigin(_ url: URL) -> Bool {
+        func port(_ u: URL) -> Int? {
+            u.port ?? (u.scheme?.lowercased() == "https" ? 443 : (u.scheme?.lowercased() == "http" ? 80 : nil))
+        }
+        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased(),
+            scheme == baseURL.scheme?.lowercased(), host == baseURL.host?.lowercased()
+        else { return false }
+        return port(url) == port(baseURL)
     }
 
     /// Uploads the local file to `uri`. When `overwrite` is true, the content
@@ -889,23 +907,35 @@ final class CloudreveClient {
     private func uploadChunk(
         credential: UploadCredentialPayload, index: Int, data: Data
     ) async throws {
-        var request: URLRequest
+        let target: URL
         if let relay = credential.upload_urls?.first, !relay.isEmpty {
-            // Relay policy: POST chunk to the provided URL
+            // Relay/remote policy: POST chunk to the provided URL
             let base =
                 relay.hasPrefix("/") ? baseURL.absoluteString + relay : relay
             let sep = base.contains("?") ? "&" : "?"
-            request = URLRequest(url: URL(string: "\(base)\(sep)chunk=\(index)")!)
-            request.httpMethod = "POST"
+            guard let url = URL(string: "\(base)\(sep)chunk=\(index)") else {
+                throw CloudreveError.badResponse("invalid upload URL")
+            }
+            target = url
         } else {
             // Local policy: POST chunk to the server
-            request = URLRequest(
-                url: baseURL.appendingPathComponent(
-                    "/api/v4/file/upload/\(credential.session_id)/\(index)"))
-            request.httpMethod = "POST"
+            target = baseURL.appendingPathComponent(
+                "/api/v4/file/upload/\(credential.session_id)/\(index)")
         }
-        request.setValue(
-            "Bearer \(try await validAccessToken())", forHTTPHeaderField: "Authorization")
+        var request = URLRequest(url: target)
+        request.httpMethod = "POST"
+        if isSameOrigin(target) {
+            request.setValue(
+                "Bearer \(try await validAccessToken())", forHTTPHeaderField: "Authorization")
+        } else if credential.storage_policy?.type == "remote",
+            let slaveCredential = credential.credential, !slaveCredential.isEmpty
+        {
+            // Slave node: the upload session credential, never the account token.
+            request.setValue(slaveCredential, forHTTPHeaderField: "Authorization")
+        } else {
+            throw CloudreveError.unsupportedStoragePolicy(
+                credential.storage_policy?.type ?? "unknown")
+        }
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.httpBody = data
 
