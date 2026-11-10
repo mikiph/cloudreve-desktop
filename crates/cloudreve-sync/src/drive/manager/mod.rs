@@ -727,7 +727,10 @@ impl DriveManager {
             sync_health.push(SyncHealth {
                 drive_id: mount.id.clone(),
                 connected: flags.is_event_push_subscribed() && !flags.is_credential_expired(),
-                recovery: crate::fileprovider::read_recovery_status(&mount.id)?,
+                recovery: crate::fileprovider::read_recovery_status(&mount.id).unwrap_or_else(|error| {
+                    tracing::warn!(target: "drive::manager", id = %mount.id, %error, "Could not read Finder recovery status");
+                    None
+                }),
             });
         }
         Ok(StatusSummary {

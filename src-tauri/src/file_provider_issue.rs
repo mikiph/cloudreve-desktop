@@ -43,13 +43,24 @@ pub struct FileProviderIssue {
     pub updated_at: i64,
 }
 
-pub fn list(known_drive_ids: &HashSet<String>) -> Result<Vec<FileProviderIssue>> {
-    let snapshots = cloudreve_sync::fileprovider_db::StateDb::open()?
-        .records("fileprovider-pending")?
+fn parse_snapshots(records: Vec<cloudreve_sync::fileprovider_db::Record>) -> Vec<PendingSnapshot> {
+    records
         .into_iter()
         .filter(|record| record.key.ends_with(".json"))
-        .map(|record| serde_json::from_str::<PendingSnapshot>(&record.payload))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .filter_map(|record| match serde_json::from_str::<PendingSnapshot>(&record.payload) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                tracing::warn!(target: "fileprovider", key = %record.key, %error, "Skipping unreadable Finder pending snapshot");
+                None
+            }
+        })
+        .collect()
+}
+
+pub fn list(known_drive_ids: &HashSet<String>) -> Result<Vec<FileProviderIssue>> {
+    let snapshots = parse_snapshots(
+        cloudreve_sync::fileprovider_db::StateDb::open()?.records("fileprovider-pending")?,
+    );
     let delete_intents = cloudreve_sync::fileprovider_db::StateDb::open()?
         .records("fileprovider-delete-intents")?
         .into_iter().map(|record| record.key).collect::<HashSet<_>>();
@@ -160,6 +171,19 @@ fn merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_pending_snapshot_does_not_hide_others() {
+        use cloudreve_sync::fileprovider_db::Record;
+        let good = r#"{"drive_id":"drive-1","drive_name":"My Files","updated_at":1,"items":[{"item_identifier":"i","filename":"f","is_folder":false,"operation":"upload","error_domain":"d","error_code":1,"message":"m"}]}"#;
+        let parsed = parse_snapshots(vec![
+            Record { key: "bad.json".into(), payload: "{".into() },
+            Record { key: "good.json".into(), payload: good.into() },
+            Record { key: "ignored.txt".into(), payload: "x".into() },
+        ]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].drive_id, "drive-1");
+    }
 
     fn pending_snapshot() -> PendingSnapshot {
         PendingSnapshot {
