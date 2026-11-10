@@ -275,6 +275,9 @@ final class CloudreveClient {
     /// Deduplicates concurrent token refreshes.
     private let refreshCoordinator = RefreshCoordinator()
 
+    /// Configuration for the per-download delegate session (the injected session's, in tests).
+    private let downloadConfiguration: URLSessionConfiguration
+
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 60
@@ -309,6 +312,7 @@ final class CloudreveClient {
         self.driveID = drive.id
         self.baseURL = URL(string: drive.instance_url)!
         self.credentials = drive.credentials
+        self.downloadConfiguration = session?.configuration ?? .default
         if let session { self.session = session }
     }
 
@@ -875,7 +879,7 @@ final class CloudreveClient {
             progress: progress,
             expectedSize: itemSize,
             onProgress: onProgress)
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let session = URLSession(configuration: downloadConfiguration, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -926,6 +930,29 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
         _ session: URLSession, downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
+        if let http = downloadTask.response as? HTTPURLResponse,
+            !(200..<300).contains(http.statusCode)
+        {
+            logger.error("download failed: HTTP \(http.statusCode, privacy: .public)")
+            continuation?.resume(throwing: CloudreveError.http(status: http.statusCode))
+            continuation = nil
+            return
+        }
+        let written =
+            (try? FileManager.default.attributesOfItem(atPath: location.path)[.size] as? NSNumber)?
+            .int64Value ?? -1
+        let advertised = downloadTask.response?.expectedContentLength ?? -1
+        if advertised > 0 && advertised != written {
+            logger.error("download truncated: \(written, privacy: .public) of \(advertised, privacy: .public)")
+            continuation?.resume(throwing: CloudreveError.badResponse("download truncated"))
+            continuation = nil
+            return
+        } else if advertised <= 0 && expectedSize > 0 && written != expectedSize {
+            logger.error("download size mismatch: \(written, privacy: .public) of \(self.expectedSize, privacy: .public)")
+            continuation?.resume(throwing: CloudreveError.badResponse("download size mismatch"))
+            continuation = nil
+            return
+        }
         do {
             try FileManager.default.createDirectory(
                 at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
