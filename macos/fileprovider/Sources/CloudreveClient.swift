@@ -941,7 +941,13 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
         let written =
             (try? FileManager.default.attributesOfItem(atPath: location.path)[.size] as? NSNumber)?
             .int64Value ?? -1
-        let advertised = downloadTask.response?.expectedContentLength ?? -1
+        // URLSession transparently decodes Content-Encoding, so the advertised
+        // (encoded) length says nothing about the decoded bytes on disk.
+        let encoding = (downloadTask.response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Content-Encoding")?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        let encoded = encoding.map { !$0.isEmpty && $0 != "identity" } ?? false
+        let advertised = encoded ? -1 : (downloadTask.response?.expectedContentLength ?? -1)
         if advertised > 0 && advertised != written {
             logger.error("download truncated: \(written, privacy: .public) of \(advertised, privacy: .public)")
             continuation?.resume(throwing: CloudreveError.badResponse("download truncated"))

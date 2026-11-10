@@ -11,11 +11,16 @@ private final class DownloadMock: URLProtocol {
         case "forbidden": (status, body) = (403, "<Error>AccessDenied</Error>")
         case "missing": (status, body) = (404, "not found")
         case "short": (status, body) = (200, "hel")
+        case "encoded": (status, body) = (200, "hello")
         default: (status, body) = (500, "unexpected")
         }
         let data = Data(body.utf8)
         // "short" omits Content-Length so only the caller-supplied item size can catch it.
-        let headers = name == "short" ? [:] : ["Content-Length": String(data.count)]
+        var headers = name == "short" ? [:] : ["Content-Length": String(data.count)]
+        if name == "encoded" {
+            // Simulates decoded output with a compressed-length header.
+            headers = ["Content-Encoding": "gzip", "Content-Length": "99"]
+        }
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status,
             httpVersion: "HTTP/1.1", headerFields: headers)!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data)
@@ -71,6 +76,17 @@ private final class DownloadMock: URLProtocol {
 
         let unknown = await fetch("ok", size: 0)
         precondition(unknown.0 == nil)
+
+        let encodedOK = await fetch("encoded", size: 5)
+        precondition(encodedOK.0 == nil, "encoded failed: \(String(describing: encodedOK.0))")
+        let encodedContent = try String(contentsOf: encodedOK.1, encoding: .utf8)
+        precondition(encodedContent == "hello")
+
+        let encodedBad = await fetch("encoded", size: 7)
+        guard case CloudreveError.badResponse? = encodedBad.0 else {
+            preconditionFailure("encoded mismatch not rejected: \(String(describing: encodedBad.0))")
+        }
+        precondition(!FileManager.default.fileExists(atPath: encodedBad.1.path))
 
         print("DownloadResponseTests: all tests passed")
     }
