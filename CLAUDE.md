@@ -110,6 +110,7 @@ macOS development notes:
 - New File Provider domains start **user-disabled**; enable once in System Settings → General → Login Items & Extensions → File Providers.
 - `pluginkit -a <appex>` is needed to register hand-built extensions; `fileproviderctl dump <domain>` shows sync engine state.
 - `log` is a zsh builtin — use `/usr/bin/log stream --predicate 'subsystem == "cloudreve.desktop.fileprovider"'` for extension logs.
+- Extension logs hash URIs, file names and item identifiers (`privacy: .private(mask: .hash)`); the same value always yields the same hash, so follow an item by its hash. Error descriptions, event types and counts stay public. Do not log file names or URIs with `.public`.
 
 #### macOS upgrade-safe build procedure
 

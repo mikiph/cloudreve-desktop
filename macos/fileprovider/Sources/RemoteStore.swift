@@ -189,7 +189,7 @@ final class RemoteStore {
                 if let existing = reverse[uri] {
                     needsRepair = true
                     logger.error(
-                        "duplicate item identity for \(uri, privacy: .public): keeping \(existing, privacy: .public), ignoring \(identifier, privacy: .public)"
+                        "duplicate item identity for \(uri, privacy: .private(mask: .hash)): keeping \(existing, privacy: .private(mask: .hash)), ignoring \(identifier, privacy: .private(mask: .hash))"
                     )
                     continue
                 }
@@ -501,7 +501,7 @@ final class RemoteStore {
                 identifier = "cloudreve-item:/\(UUID().uuidString.lowercased())"
             } while uriByIdentifier[identifier] != nil
             logger.notice(
-                "allocating a new identity for reused path \(uri, privacy: .public); old identity belongs to \(mappedURI, privacy: .public)"
+                "allocating a new identity for reused path \(uri, privacy: .private(mask: .hash)); old identity belongs to \(mappedURI, privacy: .private(mask: .hash))"
             )
             return NSFileProviderItemIdentifier(identifier)
         }
@@ -551,7 +551,7 @@ final class RemoteStore {
         if let existing = identifierByURI[uri], existing != identifier.rawValue {
             cacheLock.unlock()
             logger.error(
-                "identity collision for \(uri, privacy: .public): keeping \(existing, privacy: .public), ignoring \(identifier.rawValue, privacy: .public)"
+                "identity collision for \(uri, privacy: .private(mask: .hash)): keeping \(existing, privacy: .private(mask: .hash)), ignoring \(identifier.rawValue, privacy: .private(mask: .hash))"
             )
             return
         }
@@ -583,7 +583,7 @@ final class RemoteStore {
                     cache.removeValue(forKey: raw)
                     metadataRefreshAt.removeValue(forKey: raw)
                 }
-                logger.notice("remapped descendants of moved folder \(previousURI, privacy: .public) to \(uri, privacy: .public)")
+                logger.notice("remapped descendants of moved folder \(previousURI, privacy: .private(mask: .hash)) to \(uri, privacy: .private(mask: .hash))")
             }
             if identifierByURI[previousURI] == identifier.rawValue {
                 identifierByURI.removeValue(forKey: previousURI)
@@ -798,7 +798,7 @@ final class RemoteStore {
     ) async -> Bool {
         guard let manager = manager ?? NSFileProviderManager(for: domain) else {
             logger.error(
-                "cannot request download for \(identifier.rawValue, privacy: .public): no File Provider manager"
+                "cannot request download for \(identifier.rawValue, privacy: .private(mask: .hash)): no File Provider manager"
             )
             return false
         }
@@ -817,7 +817,7 @@ final class RemoteStore {
                     try await materializePinnedContent(identifier, manager: manager)
                 }
                 logger.notice(
-                    "download request accepted for \(identifier.rawValue, privacy: .public) on attempt \(attempt + 1)"
+                    "download request accepted for \(identifier.rawValue, privacy: .private(mask: .hash)) on attempt \(attempt + 1)"
                 )
                 let deadline = Date().addingTimeInterval(Double(attempt + 1))
                 repeat {
@@ -833,13 +833,13 @@ final class RemoteStore {
             } catch {
                 lastError = error
                 logger.error(
-                    "download request attempt \(attempt + 1) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    "download request attempt \(attempt + 1) failed for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                 )
                 try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 500_000_000)
             }
         }
         logger.error(
-            "download incomplete for \(identifier.rawValue, privacy: .public) after 5 attempts: \(lastError?.localizedDescription ?? "content is still unavailable", privacy: .public)"
+            "download incomplete for \(identifier.rawValue, privacy: .private(mask: .hash)) after 5 attempts: \(lastError?.localizedDescription ?? "content is still unavailable", privacy: .public)"
         )
         return false
     }
@@ -889,14 +889,14 @@ final class RemoteStore {
             let result = url.path.withCString { lstat($0, &info) }
             guard result == 0 else {
                 logger.error(
-                    "could not inspect local content for \(identifier.rawValue, privacy: .public): errno \(errno)"
+                    "could not inspect local content for \(identifier.rawValue, privacy: .private(mask: .hash)): errno \(errno)"
                 )
                 return .unavailable
             }
             return (info.st_flags & UInt32(SF_DATALESS)) == 0 ? .downloaded : .dataless
         } catch {
             logger.error(
-                "could not inspect local content for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                "could not inspect local content for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
             )
             return .unavailable
         }
@@ -906,7 +906,7 @@ final class RemoteStore {
         guard let manager = NSFileProviderManager(for: domain) else { return false }
         let state = await localContentState(identifier, manager: manager)
         logger.notice(
-            "local content state for \(identifier.rawValue, privacy: .public): \(state == .downloaded ? "downloaded" : "dataless", privacy: .public)"
+            "local content state for \(identifier.rawValue, privacy: .private(mask: .hash)): \(state == .downloaded ? "downloaded" : "dataless", privacy: .public)"
         )
         return state == .downloaded
     }
@@ -925,12 +925,12 @@ final class RemoteStore {
                 try await manager.evictItem(identifier: identifier)
             }
             logger.notice(
-                "evicted previous content generation for \(identifier.rawValue, privacy: .public)"
+                "evicted previous content generation for \(identifier.rawValue, privacy: .private(mask: .hash))"
             )
         } catch {
             // The post-update refresh retries after open descriptors are released.
             logger.error(
-                "could not evict previous content generation for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                "could not evict previous content generation for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
             )
         }
         return true
@@ -961,12 +961,12 @@ final class RemoteStore {
                         try await manager.evictItem(identifier: identifier)
                     }
                     logger.notice(
-                        "evicted previous content generation for \(identifier.rawValue, privacy: .public) after publishing the remote update"
+                        "evicted previous content generation for \(identifier.rawValue, privacy: .private(mask: .hash)) after publishing the remote update"
                     )
                     state = await localContentState(identifier, manager: manager)
                 } catch {
                     logger.error(
-                        "remote content refresh could not evict \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                        "remote content refresh could not evict \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                     )
                 }
             }
@@ -976,7 +976,7 @@ final class RemoteStore {
             }
             if state == .downloaded {
                 logger.notice(
-                    "materialized current remote content for \(identifier.rawValue, privacy: .public) from content policy"
+                    "materialized current remote content for \(identifier.rawValue, privacy: .private(mask: .hash)) from content policy"
                 )
                 continue
             }
@@ -990,11 +990,11 @@ final class RemoteStore {
                         try await manager.requestDownloadForItem(withIdentifier: identifier)
                     }
                     logger.notice(
-                        "requested current remote content for \(identifier.rawValue, privacy: .public) on attempt \(index + 1)"
+                        "requested current remote content for \(identifier.rawValue, privacy: .private(mask: .hash)) on attempt \(index + 1)"
                     )
                 } catch {
                     logger.error(
-                        "remote content refresh attempt \(index + 1) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                        "remote content refresh attempt \(index + 1) failed for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                     )
                 }
 
@@ -1012,11 +1012,11 @@ final class RemoteStore {
 
             if refreshed {
                 logger.notice(
-                    "materialized current remote content for \(identifier.rawValue, privacy: .public)"
+                    "materialized current remote content for \(identifier.rawValue, privacy: .private(mask: .hash))"
                 )
             } else {
                 logger.error(
-                    "current remote content remained dataless for \(identifier.rawValue, privacy: .public)"
+                    "current remote content remained dataless for \(identifier.rawValue, privacy: .private(mask: .hash))"
                 )
             }
         }
@@ -1029,7 +1029,7 @@ final class RemoteStore {
     ) async -> Bool {
         guard let manager = manager ?? NSFileProviderManager(for: domain) else {
             logger.error(
-                "cannot evict \(identifier.rawValue, privacy: .public): no File Provider manager"
+                "cannot evict \(identifier.rawValue, privacy: .private(mask: .hash)): no File Provider manager"
             )
             return false
         }
@@ -1044,13 +1044,13 @@ final class RemoteStore {
                     try await manager.evictItem(identifier: identifier)
                 }
                 logger.notice(
-                    "eviction accepted for \(identifier.rawValue, privacy: .public) on attempt \(attempt)"
+                    "eviction accepted for \(identifier.rawValue, privacy: .private(mask: .hash)) on attempt \(attempt)"
                 )
                 return true
             } catch {
                 lastError = error
                 logger.error(
-                    "eviction attempt \(attempt) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    "eviction attempt \(attempt) failed for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                 )
                 if attempt < 6 {
                     try? await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
@@ -1058,7 +1058,7 @@ final class RemoteStore {
             }
         }
         logger.error(
-            "eviction failed for \(identifier.rawValue, privacy: .public) after 6 attempts: \(lastError?.localizedDescription ?? "unknown error", privacy: .public)"
+            "eviction failed for \(identifier.rawValue, privacy: .private(mask: .hash)) after 6 attempts: \(lastError?.localizedDescription ?? "unknown error", privacy: .public)"
         )
         return false
     }
@@ -1101,7 +1101,7 @@ final class RemoteStore {
                 }
             } catch {
                 logger.error(
-                    "failed to resume pinned downloads for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    "failed to resume pinned downloads for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                 )
             }
         }
@@ -1146,7 +1146,7 @@ final class RemoteStore {
             }
             let unresolved = remaining.prefix(3).map(\.rawValue).joined(separator: ", ")
             self.logger.error(
-                "deferred eviction still pending after retries: \(unresolved, privacy: .public)"
+                "deferred eviction still pending after retries: \(unresolved, privacy: .private(mask: .hash))"
             )
         }
     }
@@ -1188,7 +1188,7 @@ final class RemoteStore {
                     gone.insert(raw)
                 } else {
                     logger.error(
-                        "missing candidate \(raw, privacy: .public) unverified: \(error.localizedDescription, privacy: .public)"
+                        "missing candidate \(raw, privacy: .private(mask: .hash)) unverified: \(error.localizedDescription, privacy: .public)"
                     )
                 }
             case .success(let file):
@@ -1254,12 +1254,12 @@ final class RemoteStore {
                 }
             } catch CloudreveError.noSuchItem {
                 logger.notice(
-                    "presented folder \(container.rawValue, privacy: .public) no longer exists"
+                    "presented folder \(container.rawValue, privacy: .private(mask: .hash)) no longer exists"
                 )
                 extinctContainers.insert(container.rawValue)
             } catch {
                 logger.error(
-                    "presented folder \(container.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                    "presented folder \(container.rawValue, privacy: .private(mask: .hash)) failed: \(error.localizedDescription, privacy: .public)"
                 )
                 // Keep the lightweight refresh event pending after a transient
                 // error instead of acknowledging an incomplete reconciliation.
@@ -1287,7 +1287,7 @@ final class RemoteStore {
                     }
                 } catch CloudreveError.noSuchItem {
                     logger.notice(
-                        "pinned item \(rawIdentifier, privacy: .public) no longer exists"
+                        "pinned item \(rawIdentifier, privacy: .private(mask: .hash)) no longer exists"
                     )
                     extinctContainers.insert(rawIdentifier)
                 }
@@ -1307,7 +1307,7 @@ final class RemoteStore {
                     // The remote delete superseded the update.
                 } catch where ReplayFailure.classify(error) == .permanent {
                     logger.error(
-                        "pending policy update \(uri, privacy: .public) skipped: \(error.localizedDescription, privacy: .public)"
+                        "pending policy update \(uri, privacy: .private(mask: .hash)) skipped: \(error.localizedDescription, privacy: .public)"
                     )
                 }
             }
@@ -1327,12 +1327,12 @@ final class RemoteStore {
                     }
                 } catch CloudreveError.noSuchItem {
                     logger.notice(
-                        "working-set folder \(folder.rawValue, privacy: .public) no longer exists"
+                        "working-set folder \(folder.rawValue, privacy: .private(mask: .hash)) no longer exists"
                     )
                     extinctContainers.insert(folder.rawValue)
                 } catch {
                     logger.error(
-                        "working-set folder \(folder.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                        "working-set folder \(folder.rawValue, privacy: .private(mask: .hash)) failed: \(error.localizedDescription, privacy: .public)"
                     )
                 }
             }
@@ -1514,7 +1514,7 @@ final class RemoteStore {
                 Set(pins).isDisjoint(with: matches) {
                 do {
                     try database.execute("DELETE FROM fp_records WHERE namespace='pin-requests' AND key=? AND payload=?", row)
-                    logger.notice("applied pin removal for \(uri, privacy: .public)")
+                    logger.notice("applied pin removal for \(uri, privacy: .private(mask: .hash))")
                 } catch {
                     logger.error("could not acknowledge pin removal: \(error.localizedDescription, privacy: .public)")
                 }
@@ -1643,7 +1643,7 @@ final class RemoteStore {
         let nextTimestamp = hasBufferedChanges ? (page.last?.ts ?? since) : snapshot.readThrough
         let newAnchor = NSFileProviderSyncAnchor(Data("evt-\(nextTimestamp)".utf8))
         logger.notice(
-            "changes for \(container.rawValue, privacy: .public): anchor \(since), relevant \(relevant.count), delivered \(page.count), next \(nextTimestamp), moreComing \(moreComing)"
+            "changes for \(container.rawValue, privacy: .private(mask: .hash)): anchor \(since), relevant \(relevant.count), delivered \(page.count), next \(nextTimestamp), moreComing \(moreComing)"
         )
         return (page, newAnchor, moreComing)
     }
@@ -1754,7 +1754,7 @@ final class RemoteStore {
             metadataRefreshAt[rawIdentifier] = Date()
         }
         cacheLock.unlock()
-        logger.notice("marked item locked: \(itemURI, privacy: .public)")
+        logger.notice("marked item locked: \(itemURI, privacy: .private(mask: .hash))")
     }
 
     func clearLockState(for uri: String) {
@@ -1967,7 +1967,7 @@ final class RemoteStore {
                             await signalWorkingSet()
                         }
                     } catch {
-                        logger.error("presented refresh deferred for \(folder.uri, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                        logger.error("presented refresh deferred for \(folder.uri, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)")
                         try deferPresentedFolder(folder)
                     }
                     await Task.yield()
@@ -2011,7 +2011,7 @@ final class RemoteStore {
                             _ = try await parentItemsForUpdate(file)
                             _ = makeItem(file)
                             try requestSubtreeRefresh(file)
-                            logger.notice("queued repair of previously moved folder \(file.path, privacy: .public)")
+                            logger.notice("queued repair of previously moved folder \(file.path, privacy: .private(mask: .hash))")
                         }
                     } catch CloudreveError.noSuchItem {
                         // It moved again or was deleted. Later destinations are
@@ -2633,7 +2633,7 @@ final class RemoteStore {
                 continue
             } catch {
                 logger.error(
-                    "presented share metadata listing failed for \(container.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    "presented share metadata listing failed for \(container.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                 )
             }
         }
@@ -2655,7 +2655,7 @@ final class RemoteStore {
                     metadataRevision: revision))
             } catch { continue }
         }
-        logger.notice("named share refresh \(name, privacy: .public): \(refreshed.count) item(s)")
+        logger.notice("named share refresh \(name, privacy: .private(mask: .hash)): \(refreshed.count) item(s)")
         return refreshed
     }
 
@@ -2819,19 +2819,19 @@ final class RemoteStore {
         if let cached {
             if !refreshIfStale || metadataIsFresh(for: identifier) {
                 logger.debug(
-                    "metadata cache hit for \(identifier.rawValue, privacy: .public)")
+                    "metadata cache hit for \(identifier.rawValue, privacy: .private(mask: .hash))")
                 return cached
             }
 
             logger.debug(
-                "refreshing stale metadata for \(identifier.rawValue, privacy: .public)")
+                "refreshing stale metadata for \(identifier.rawValue, privacy: .private(mask: .hash))")
             do {
                 return try await refreshItem(for: identifier, displayName: displayName)
             } catch CloudreveError.noSuchItem {
                 throw CloudreveError.noSuchItem
             } catch {
                 logger.notice(
-                    "metadata refresh failed for \(identifier.rawValue, privacy: .public); using cached item: \(error.localizedDescription, privacy: .public)"
+                    "metadata refresh failed for \(identifier.rawValue, privacy: .private(mask: .hash)); using cached item: \(error.localizedDescription, privacy: .public)"
                 )
                 return cached
             }
@@ -2839,7 +2839,7 @@ final class RemoteStore {
 
         // Resolve items not present in the session cache.
         logger.debug(
-            "metadata cache miss for \(identifier.rawValue, privacy: .public)")
+            "metadata cache miss for \(identifier.rawValue, privacy: .private(mask: .hash))")
         return try await refreshItem(for: identifier, displayName: displayName)
     }
 
@@ -2890,7 +2890,7 @@ final class RemoteStore {
                     uri: itemURI)
             } catch {
                 logger.notice(
-                    "share verification failed for \(itemURI, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    "share verification failed for \(itemURI, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                 )
             }
         }
@@ -2901,7 +2901,7 @@ final class RemoteStore {
             if file.shared == true { count += 1 }
         }
         logger.info(
-            "listed \(identifier.rawValue, privacy: .public): \(visible.count) items, shared: \(sharedCount), next: \(result.nextPage ?? "nil", privacy: .public)")
+            "listed \(identifier.rawValue, privacy: .private(mask: .hash)): \(visible.count) items, shared: \(sharedCount), next: \(result.nextPage ?? "nil", privacy: .public)")
         let identityRevision = currentIdentityRevision()
         let items = verified.map { makeItem($0, metadataRevision: revision, persistIdentity: false) }
         persistIdentityBatch(since: identityRevision)
