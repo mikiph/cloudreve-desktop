@@ -37,6 +37,12 @@ extension RemoteStore {
         let atPath = identifier(forURI: uri)
         guard let fileID, !fileID.isEmpty else { return atPath }
         let own = ItemIdentity.remoteID(fileID, fallbackURI: uri)
+        // No mapping for the path (e.g. the identity was already evicted):
+        // the event's stable file id is the best identity to report.
+        cacheLock.lock()
+        let hasMapping = identifierByURI[Self.canonicalURI(uri)] != nil
+        cacheLock.unlock()
+        if !hasMapping { return NSFileProviderItemIdentifier(own) }
         guard atPath.rawValue.hasPrefix(ItemIdentity.remotePrefix), atPath.rawValue != own else {
             return atPath
         }

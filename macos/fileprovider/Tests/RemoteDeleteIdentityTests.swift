@@ -34,7 +34,14 @@ import FileProvider
         precondition(store.identifierForRemoteDelete(uri: path, fileID: "B").rawValue == "cloudreve-item:/B")
         // Items known only by a legacy path identity cannot be compared by ID.
         let legacy = "cloudreve://my/legacy.txt"
+        store.recordIdentity(NSFileProviderItemIdentifier(legacy), uri: legacy, isFolder: false, persist: false)
         precondition(store.identifierForRemoteDelete(uri: legacy, fileID: "X") == store.identifier(forURI: legacy))
+        // An unmapped path with a file id resolves to the id identity.
+        precondition(store.identifierForRemoteDelete(uri: "cloudreve://my/gone.txt", fileID: "G").rawValue == "cloudreve-item:/G")
+        // Regression: identity already evicted before the journal delete is replayed.
+        _ = store.makeItem(file("P", path: "cloudreve://my/pinned.txt"))
+        store.evictCachedItems(withIdentifiers: [NSFileProviderItemIdentifier("cloudreve-item:/P")])
+        precondition(store.identifierForRemoteDelete(uri: "cloudreve://my/pinned.txt", fileID: "P").rawValue == "cloudreve-item:/P")
 
         // Replay persists identities once per batch, not once per item.
         let identityFile = root.appendingPathComponent("identities-\(drive.id).json")
