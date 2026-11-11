@@ -86,15 +86,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         if let token = (item as? FileProviderItem)?.remoteVersion, !token.isEmpty {
             return token
         }
-        guard var value = String(data: baseVersion.contentVersion, encoding: .utf8) else {
-            return nil
-        }
-        if value.hasSuffix("#thumbnail-v1") {
-            value.removeLast("#thumbnail-v1".count)
-        }
-        guard value.hasPrefix("entity:") else { return nil }
-        let token = String(value.dropFirst("entity:".count))
-        return token.isEmpty ? nil : token
+        return DeletePreflight.entityToken(baseVersion.contentVersion)
     }
 
     private func uploadConflictError(_ record: UploadConflictRecord) -> Error {
@@ -662,6 +654,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 let previousVersion = existingConflict?.previousVersion
                     ?? versionToken(for: item, baseVersion: version)
 
+                var appliedAny = false
                 // Apply supported content, name, and parent changes.
                 if changedFields.contains(.contents), let newContents {
                     if let existingConflict, conflictAction == nil {
@@ -739,19 +732,55 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                             driveID: store.drive.id, uri: originalURI))
                     store.clearLockState(for: uri)
                     pending.remove(.contents)
+                    appliedAny = true
                 }
 
-                if changedFields.contains(.filename) {
-                    _ = try await store.client.renameFile(uri: uri, to: item.filename)
-                    uri = Self.parentURI(of: uri) + "/" + item.filename
-                    pending.remove(.filename)
-                }
+                do {
+                    if changedFields.contains(.filename) {
+                        let target = Self.parentURI(of: uri) + "/" + item.filename
+                        do {
+                            _ = try await store.client.renameFile(uri: uri, to: item.filename)
+                        } catch CloudreveError.noSuchItem {
+                            let existing = try? await store.client.fileInfo(uri: target)
+                            guard MutationReplay.alreadyApplied(
+                                identifier: item.itemIdentifier.rawValue,
+                                destination: existing) else { throw CloudreveError.noSuchItem }
+                            logger.notice("rename of \(item.itemIdentifier.rawValue, privacy: .public) was already applied")
+                        }
+                        uri = target
+                        pending.remove(.filename)
+                        appliedAny = true
+                    }
 
-                if changedFields.contains(.parentItemIdentifier) {
-                    let dst = store.uri(for: item.parentItemIdentifier)
-                    try await store.client.moveFile(uri: uri, toDirectory: dst)
-                    uri = dst + "/" + item.filename
-                    pending.remove(.parentItemIdentifier)
+                    if changedFields.contains(.parentItemIdentifier) {
+                        let dst = store.uri(for: item.parentItemIdentifier)
+                        let target = dst + "/" + item.filename
+                        do {
+                            try await store.client.moveFile(uri: uri, toDirectory: dst)
+                        } catch CloudreveError.noSuchItem {
+                            let existing = try? await store.client.fileInfo(uri: target)
+                            guard MutationReplay.alreadyApplied(
+                                identifier: item.itemIdentifier.rawValue,
+                                destination: existing) else { throw CloudreveError.noSuchItem }
+                            logger.notice("move of \(item.itemIdentifier.rawValue, privacy: .public) was already applied")
+                        }
+                        uri = target
+                        pending.remove(.parentItemIdentifier)
+                        appliedAny = true
+                    }
+                } catch {
+                    if appliedAny, ReplayFailure.classify(error) != .cancelled,
+                        let fresh = try? await store.client.fileInfoWithShareState(uri: uri)
+                    {
+                        logger.notice(
+                            "modify of \(uri, privacy: .public) applied partially; deferring \(pending.rawValue)"
+                        )
+                        completionHandler(
+                            store.makeItem(fresh, preservingIdentifier: item.itemIdentifier),
+                            pending, false, nil)
+                        return
+                    }
+                    throw error
                 }
 
                 if try FileProviderDeleteIntentStore.containsURI(driveID: store.drive.id, uri: originalURI)
@@ -830,11 +859,28 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
         Task {
             do {
+                let uri = store.uri(for: identifier)
+                let remote = try await store.client.fileInfo(uri: uri)
+                var childNames: [String]? = nil
+                if remote.isFolder && !options.contains(.recursive) {
+                    childNames = try await store.client.listDirectory(uri: uri, page: nil).files.map(\.name)
+                }
+                switch DeletePreflight.decide(remote: remote, recursive: options.contains(.recursive),
+                                              remoteChildNames: childNames,
+                                              baseContentVersion: version.contentVersion) {
+                case .proceed: break
+                case .directoryNotEmpty:
+                    logger.notice("refused non-recursive delete of non-empty \(identifier.rawValue, privacy: .public)")
+                    completionHandler(NSFileProviderError(.directoryNotEmpty)); return
+                case .deletionRejected:
+                    logger.notice("refused delete of remotely changed \(identifier.rawValue, privacy: .public)")
+                    completionHandler(NSFileProviderError(.deletionRejected)); return
+                }
                 try FileProviderDeleteIntentStore.begin(driveID: store.drive.id,
-                    identifier: identifier.rawValue, uri: store.uri(for: identifier))
-                store.recordRemoteDelete(for: store.uri(for: identifier))
-                try await store.client.cancelOwnedUploads(under: store.uri(for: identifier))
-                try await store.client.deleteFile(uri: store.uri(for: identifier))
+                    identifier: identifier.rawValue, uri: uri)
+                store.recordRemoteDelete(for: uri)
+                try await store.client.cancelOwnedUploads(under: uri)
+                try await store.client.deleteFile(uri: uri)
                 try FileProviderDeleteIntentStore.finish(driveID: store.drive.id, identifier: identifier.rawValue)
                 store.evictCachedItems(withIdentifiers: [identifier])
                 logger.notice("deleted \(identifier.rawValue, privacy: .public)")
