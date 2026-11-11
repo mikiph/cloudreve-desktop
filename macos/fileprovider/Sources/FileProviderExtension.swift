@@ -654,6 +654,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 let previousVersion = existingConflict?.previousVersion
                     ?? versionToken(for: item, baseVersion: version)
 
+                var appliedAny = false
                 // Apply supported content, name, and parent changes.
                 if changedFields.contains(.contents), let newContents {
                     if let existingConflict, conflictAction == nil {
@@ -731,19 +732,55 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                             driveID: store.drive.id, uri: originalURI))
                     store.clearLockState(for: uri)
                     pending.remove(.contents)
+                    appliedAny = true
                 }
 
-                if changedFields.contains(.filename) {
-                    _ = try await store.client.renameFile(uri: uri, to: item.filename)
-                    uri = Self.parentURI(of: uri) + "/" + item.filename
-                    pending.remove(.filename)
-                }
+                do {
+                    if changedFields.contains(.filename) {
+                        let target = Self.parentURI(of: uri) + "/" + item.filename
+                        do {
+                            _ = try await store.client.renameFile(uri: uri, to: item.filename)
+                        } catch CloudreveError.noSuchItem {
+                            let existing = try? await store.client.fileInfo(uri: target)
+                            guard MutationReplay.alreadyApplied(
+                                identifier: item.itemIdentifier.rawValue,
+                                destination: existing) else { throw CloudreveError.noSuchItem }
+                            logger.notice("rename of \(item.itemIdentifier.rawValue, privacy: .public) was already applied")
+                        }
+                        uri = target
+                        pending.remove(.filename)
+                        appliedAny = true
+                    }
 
-                if changedFields.contains(.parentItemIdentifier) {
-                    let dst = store.uri(for: item.parentItemIdentifier)
-                    try await store.client.moveFile(uri: uri, toDirectory: dst)
-                    uri = dst + "/" + item.filename
-                    pending.remove(.parentItemIdentifier)
+                    if changedFields.contains(.parentItemIdentifier) {
+                        let dst = store.uri(for: item.parentItemIdentifier)
+                        let target = dst + "/" + item.filename
+                        do {
+                            try await store.client.moveFile(uri: uri, toDirectory: dst)
+                        } catch CloudreveError.noSuchItem {
+                            let existing = try? await store.client.fileInfo(uri: target)
+                            guard MutationReplay.alreadyApplied(
+                                identifier: item.itemIdentifier.rawValue,
+                                destination: existing) else { throw CloudreveError.noSuchItem }
+                            logger.notice("move of \(item.itemIdentifier.rawValue, privacy: .public) was already applied")
+                        }
+                        uri = target
+                        pending.remove(.parentItemIdentifier)
+                        appliedAny = true
+                    }
+                } catch {
+                    if appliedAny, ReplayFailure.classify(error) != .cancelled,
+                        let fresh = try? await store.client.fileInfoWithShareState(uri: uri)
+                    {
+                        logger.notice(
+                            "modify of \(uri, privacy: .public) applied partially; deferring \(pending.rawValue)"
+                        )
+                        completionHandler(
+                            store.makeItem(fresh, preservingIdentifier: item.itemIdentifier),
+                            pending, false, nil)
+                        return
+                    }
+                    throw error
                 }
 
                 if try FileProviderDeleteIntentStore.containsURI(driveID: store.drive.id, uri: originalURI)
