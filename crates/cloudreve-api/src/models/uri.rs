@@ -26,6 +26,24 @@ fn encode_uri_component(s: &str) -> String {
     percent_encode(s.as_bytes(), ENCODE_URI_COMPONENT_SET).to_string()
 }
 
+/// Percent-encode a raw (already decoded) `cloudreve://` URI so `CrUri::new`
+/// does not treat `#`, `?` or `%` in names as URL syntax. The authority part
+/// is kept verbatim; strings without the prefix are returned unchanged.
+pub fn encode_raw_uri(raw: &str) -> String {
+    let Some(rest) = raw.strip_prefix(CR_URI_PREFIX) else {
+        return raw.to_string();
+    };
+    let Some((authority, path)) = rest.split_once('/') else {
+        return raw.to_string();
+    };
+    let encoded = path
+        .split('/')
+        .map(encode_uri_component)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{CR_URI_PREFIX}{authority}/{encoded}")
+}
+
 /// Decode a percent-encoded string
 fn decode_uri_component(s: &str) -> String {
     percent_decode_str(s)
@@ -525,5 +543,22 @@ mod tests {
             uri.join(segments);
             assert_eq!(&uri.to_string(), expected, "segments {:?}", segments);
         }
+    }
+
+    #[test]
+    fn encode_raw_uri_escapes_url_syntax_in_names() {
+        let cases = [
+            ("cloudreve://my/a#b.txt", "cloudreve://my/a%23b.txt"),
+            ("cloudreve://my/100%.txt", "cloudreve://my/100%25.txt"),
+            ("cloudreve://my/a b/é.txt", "cloudreve://my/a%20b/%C3%A9.txt"),
+            ("cloudreve://my", "cloudreve://my"),
+            ("cloudreve://my/", "cloudreve://my/"),
+            ("not-a-uri#x", "not-a-uri#x"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(encode_raw_uri(raw), expected, "raw {raw}");
+        }
+        let uri = CrUri::new(&encode_raw_uri("cloudreve://my/a#b.txt")).unwrap();
+        assert_eq!(uri.elements().last().map(String::as_str), Some("a#b.txt"));
     }
 }
