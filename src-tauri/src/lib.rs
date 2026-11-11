@@ -206,6 +206,9 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
                     let drives = manager.list_drives().await;
                     applied.retain(|id, _| drives.iter().any(|drive| &drive.id == id));
                     for drive in drives.iter().filter(|drive| drive.enabled) {
+                        // shutdown() stops waiting for this lock after 15 s and disconnects every
+                        // domain itself. Never reconnect a domain after that has started.
+                        if SHUTDOWN_STARTED.load(Ordering::Acquire) { break; }
                         let Some(mount) = manager.get_drive(&drive.id).await else { continue; };
                         let flags = mount.get_status_flags().await;
                         let connected = flags.is_event_push_subscribed() && !flags.is_credential_expired();
@@ -223,6 +226,9 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
                         } else {
                             "Cloudreve is reconnecting to the server. Check your internet connection. Syncing resumes automatically."
                         };
+                        // shutdown() stops waiting for this lock after 15 s and disconnects every
+                        // domain itself. Never reconnect a domain after that has started.
+                        if SHUTDOWN_STARTED.load(Ordering::Acquire) { break; }
                         match cloudreve_sync::fileprovider::set_domain_connected(
                             &cloudreve_sync::fileprovider::domain_identifier(&drive.id),
                             &drive.name, connected, reason,
