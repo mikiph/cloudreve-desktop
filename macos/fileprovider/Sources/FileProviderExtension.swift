@@ -822,11 +822,28 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
         Task {
             do {
+                let uri = store.uri(for: identifier)
+                let remote = try await store.client.fileInfo(uri: uri)
+                var childNames: [String]? = nil
+                if remote.isFolder && !options.contains(.recursive) {
+                    childNames = try await store.client.listDirectory(uri: uri, page: nil).files.map(\.name)
+                }
+                switch DeletePreflight.decide(remote: remote, recursive: options.contains(.recursive),
+                                              remoteChildNames: childNames,
+                                              baseContentVersion: version.contentVersion) {
+                case .proceed: break
+                case .directoryNotEmpty:
+                    logger.notice("refused non-recursive delete of non-empty \(identifier.rawValue, privacy: .public)")
+                    completionHandler(NSFileProviderError(.directoryNotEmpty)); return
+                case .deletionRejected:
+                    logger.notice("refused delete of remotely changed \(identifier.rawValue, privacy: .public)")
+                    completionHandler(NSFileProviderError(.deletionRejected)); return
+                }
                 try FileProviderDeleteIntentStore.begin(driveID: store.drive.id,
-                    identifier: identifier.rawValue, uri: store.uri(for: identifier))
-                store.recordRemoteDelete(for: store.uri(for: identifier))
-                try await store.client.cancelOwnedUploads(under: store.uri(for: identifier))
-                try await store.client.deleteFile(uri: store.uri(for: identifier))
+                    identifier: identifier.rawValue, uri: uri)
+                store.recordRemoteDelete(for: uri)
+                try await store.client.cancelOwnedUploads(under: uri)
+                try await store.client.deleteFile(uri: uri)
                 try FileProviderDeleteIntentStore.finish(driveID: store.drive.id, identifier: identifier.rawValue)
                 store.evictCachedItems(withIdentifiers: [identifier])
                 logger.notice("deleted \(identifier.rawValue, privacy: .public)")
