@@ -88,6 +88,11 @@ final class RemoteStore {
     /// Stable identities confirmed absent remotely. Finder may replay these
     /// as create callbacks after a domain is re-registered.
     private var deletedIdentityURIs: [String: String] = [:]
+    /// Deletion time (ms since epoch) per tombstone; guarded by cacheLock.
+    private var deletedIdentityTimes: [String: Int64] = [:]
+    static let tombstoneRetention: TimeInterval = 30 * 24 * 3600
+    static var tombstoneLimit = 50_000
+    var tombstoneClock: () -> Date = Date.init
     /// Version marker used to force a working-set refresh after policy changes.
     private static let policyMetadataVersion = "finder-metadata-v8-sharing-sentence-case"
     private static let metadataRefreshTTL: TimeInterval = 5
@@ -105,6 +110,9 @@ final class RemoteStore {
     // Keep this bounded to avoid turning a reconnect into a full-drive crawl.
     private static let presentedContainerLimit = 128
     private let cacheLock = NSLock()
+    /// Serializes the read-modify-write of pending-pinned-<drive>.json.
+    /// Never take cacheLock while holding this lock, or the reverse.
+    private let pendingPolicyUpdatesLock = NSLock()
     private let pinRequestLock = NSLock()
     private let stateDirectoryOverride: URL?
     private let pinRequestDirectoryOverride: URL?
@@ -208,6 +216,14 @@ final class RemoteStore {
                 uniqueKeysWithValues: saved.map {
                     (Self.canonicalIdentifier($0.key), Self.canonicalURI($0.value))
                 })
+            let savedTimes: [String: Int64] =
+                (try? Data(contentsOf: deletedIdentityTimesFileURL))
+                .flatMap { try? JSONDecoder().decode([String: Int64].self, from: $0) } ?? [:]
+            let now = tombstoneNowMillis()
+            for raw in deletedIdentityURIs.keys {
+                deletedIdentityTimes[raw] = savedTimes[raw] ?? now
+            }
+            pruneTombstonesLocked(now: now)
         }
         // Persist presented folders for later reconciliation.
         if let data = try? Data(contentsOf: presentedFileURL),
@@ -255,6 +271,37 @@ final class RemoteStore {
             .appendingPathComponent("deleted-identities-\(drive.id).json")
     }
 
+    private var deletedIdentityTimesFileURL: URL {
+        stateDirectoryURL
+            .appendingPathComponent("deleted-identities-\(drive.id).times.json")
+    }
+
+    private func tombstoneNowMillis() -> Int64 {
+        Int64(tombstoneClock().timeIntervalSince1970 * 1000)
+    }
+
+    /// Drops tombstones older than the retention window, then the oldest
+    /// beyond the count cap. Call with cacheLock held.
+    private func pruneTombstonesLocked(now: Int64) {
+        let cutoff = now - Int64(Self.tombstoneRetention * 1000)
+        var doomed = Set(deletedIdentityURIs.keys.filter {
+            (deletedIdentityTimes[$0] ?? now) < cutoff
+        })
+        let remaining = deletedIdentityURIs.count - doomed.count
+        if remaining > Self.tombstoneLimit {
+            let survivors = deletedIdentityURIs.keys.filter { !doomed.contains($0) }
+                .sorted { (deletedIdentityTimes[$0] ?? now) < (deletedIdentityTimes[$1] ?? now) }
+            doomed.formUnion(survivors.prefix(remaining - Self.tombstoneLimit))
+        }
+        for raw in doomed {
+            deletedIdentityURIs.removeValue(forKey: raw)
+            deletedIdentityTimes.removeValue(forKey: raw)
+        }
+        for raw in Array(deletedIdentityTimes.keys) where deletedIdentityURIs[raw] == nil {
+            deletedIdentityTimes.removeValue(forKey: raw)
+        }
+    }
+
     private var presentedFileURL: URL {
         stateDirectoryURL
             .appendingPathComponent("presented-\(drive.id).json")
@@ -283,7 +330,7 @@ final class RemoteStore {
             let request
         else { return }
         for url in [
-            identityFileURL, deletedIdentitiesFileURL, pinnedFileURL,
+            identityFileURL, deletedIdentitiesFileURL, deletedIdentityTimesFileURL, pinnedFileURL,
             presentedFileURL, pendingPolicyUpdatesFileURL,
             policyMetadataVersionURL, policyRescanMarkerURL,
         ] {
@@ -324,7 +371,9 @@ final class RemoteStore {
         identityPersistenceLock.lock()
         defer { identityPersistenceLock.unlock() }
         cacheLock.lock()
+        pruneTombstonesLocked(now: tombstoneNowMillis())
         let snapshot = deletedIdentityURIs
+        let timesSnapshot = deletedIdentityTimes
         cacheLock.unlock()
         do {
             try FileManager.default.createDirectory(
@@ -332,6 +381,8 @@ final class RemoteStore {
                 withIntermediateDirectories: true)
             try JSONEncoder().encode(snapshot).write(
                 to: deletedIdentitiesFileURL, options: .atomic)
+            try JSONEncoder().encode(timesSnapshot).write(
+                to: deletedIdentityTimesFileURL, options: .atomic)
         } catch {
             logger.error(
                 "failed to persist deleted identities: \(error.localizedDescription, privacy: .public)"
@@ -543,6 +594,7 @@ final class RemoteStore {
         identifierByURI[uri] = identifier.rawValue
         let deletedIdentityChanged =
             deletedIdentityURIs.removeValue(forKey: identifier.rawValue) != nil
+        deletedIdentityTimes.removeValue(forKey: identifier.rawValue)
         let snapshot = uriByIdentifier
         let deletedSnapshot = deletedIdentityURIs
         let batching = identityBatchDepth > 0
@@ -697,11 +749,9 @@ final class RemoteStore {
 
     /// Queue items whose content policy changed.
     func recordPendingItemUpdates(uris: [String]) {
-        cacheLock.lock()
+        pendingPolicyUpdatesLock.lock()
         var pending = readPendingPolicyUpdates()
         pending.formUnion(uris)
-        policyRescanPending = true
-        cacheLock.unlock()
         do {
             try FileManager.default.createDirectory(
                 at: pendingPolicyUpdatesFileURL.deletingLastPathComponent(),
@@ -712,6 +762,10 @@ final class RemoteStore {
             logger.error(
                 "failed to persist pending item updates: \(error.localizedDescription, privacy: .public)")
         }
+        pendingPolicyUpdatesLock.unlock()
+        cacheLock.lock()
+        policyRescanPending = true
+        cacheLock.unlock()
         persistPolicyRescanMarker()
     }
 
@@ -723,16 +777,16 @@ final class RemoteStore {
     }
 
     private func pendingItemUpdatesSnapshot() -> Set<String> {
-        cacheLock.lock()
-        defer { cacheLock.unlock() }
+        pendingPolicyUpdatesLock.lock()
+        defer { pendingPolicyUpdatesLock.unlock() }
         return readPendingPolicyUpdates()
     }
 
     /// Take queued policy updates, clearing the persisted list.
     func takePendingItemUpdates() -> [String] {
-        cacheLock.lock()
+        pendingPolicyUpdatesLock.lock()
+        defer { pendingPolicyUpdatesLock.unlock() }
         let pending = readPendingPolicyUpdates()
-        cacheLock.unlock()
         try? FileManager.default.removeItem(at: pendingPolicyUpdatesFileURL)
         return pending.sorted()
     }
@@ -2637,6 +2691,7 @@ final class RemoteStore {
                 identityChildrenByParent[parentPath(of: uri)]?.remove(raw)
                 lockExpiryByURI.removeValue(forKey: uri)
                 deletedIdentityURIs[raw] = uri
+                deletedIdentityTimes[raw] = tombstoneNowMillis()
                 if identifierByURI[uri] == raw {
                     identifierByURI.removeValue(forKey: uri)
                 }
