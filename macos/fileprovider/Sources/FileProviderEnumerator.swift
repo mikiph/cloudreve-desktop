@@ -374,7 +374,8 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     NSLocalizedDescriptionKey:
                         application == "upload" ? "An unfinished upload is holding this item." : "Someone has this file open online."
                 ])
-        case CloudreveError.unsupportedPackage, CloudreveError.unsupportedStoragePolicy:
+        case CloudreveError.unsupportedPackage, CloudreveError.unsupportedStoragePolicy,
+            CloudreveError.invalidName:
             return NSError(domain: NSFileProviderErrorDomain,
                 code: NSFileProviderError.Code.cannotSynchronize.rawValue,
                 userInfo: [NSLocalizedDescriptionKey: error.localizedDescription])

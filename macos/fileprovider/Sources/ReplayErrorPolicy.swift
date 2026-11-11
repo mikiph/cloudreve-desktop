@@ -32,7 +32,7 @@ enum ReplayFailure: Equatable {
             case .api(let code, _):
                 return code >= 50000 ? .transient : .permanent
             case .badResponse, .nameCollision, .staleVersion, .lockConflict,
-                .unsupportedPackage, .unsupportedStoragePolicy, .noSuchItem:
+                .unsupportedPackage, .unsupportedStoragePolicy, .noSuchItem, .invalidName:
                 return .permanent
             }
         }

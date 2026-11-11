@@ -221,6 +221,8 @@ enum CloudreveError: Error, LocalizedError {
     case nameCollision
     case staleVersion
     case unsupportedPackage
+    /// The name is empty, `.`/`..`, or contains characters Cloudreve forbids.
+    case invalidName(String)
     case lockConflict(path: String?, application: String?, ownerID: String?)
     case badResponse(String)
     case unsupportedStoragePolicy(String)
@@ -235,6 +237,7 @@ enum CloudreveError: Error, LocalizedError {
         case .noSuchItem: return "No such item"
         case .nameCollision: return "An item with the same name already exists"
         case .unsupportedPackage: return "This macOS package cannot be uploaded directly. Compress it into a ZIP file and upload the ZIP instead."
+        case .invalidName: return "Cloudreve does not allow these characters in names: \\ / : * ? \" < > |. Rename the item to continue."
         case .staleVersion: return "The item changed on the server before this update was saved"
         case .lockConflict(_, let application, _):
             return application == "upload"
