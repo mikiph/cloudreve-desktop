@@ -86,15 +86,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         if let token = (item as? FileProviderItem)?.remoteVersion, !token.isEmpty {
             return token
         }
-        guard var value = String(data: baseVersion.contentVersion, encoding: .utf8) else {
-            return nil
-        }
-        if value.hasSuffix("#thumbnail-v1") {
-            value.removeLast("#thumbnail-v1".count)
-        }
-        guard value.hasPrefix("entity:") else { return nil }
-        let token = String(value.dropFirst("entity:".count))
-        return token.isEmpty ? nil : token
+        return DeletePreflight.entityToken(baseVersion.contentVersion)
     }
 
     private func uploadConflictError(_ record: UploadConflictRecord) -> Error {
