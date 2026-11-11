@@ -25,6 +25,11 @@ enum NameValidationTests {
         precondition(mapped.code == NSFileProviderError.Code.cannotSynchronize.rawValue)
         precondition(mapped.localizedDescription.contains("Rename the item"))
         precondition(ReplayFailure.classify(CloudreveError.invalidName("?")) == .permanent)
+        precondition(
+            CloudreveError.invalidName("?").localizedDescription
+                .hasPrefix("Cloudreve does not allow these characters in names"),
+            "Rust INVALID_NAME_MESSAGE_PREFIX must match this message"
+        )
         print("NameValidationTests passed")
     }
 }

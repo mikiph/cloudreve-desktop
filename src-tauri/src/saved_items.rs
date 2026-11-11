@@ -128,7 +128,7 @@ fn provider_state() -> Result<std::path::PathBuf, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_state<T: serde::de::DeserializeOwned + Default>(name: &str) -> Result<T, String> {
+pub(crate) fn read_state<T: serde::de::DeserializeOwned + Default>(name: &str) -> Result<T, String> {
     match std::fs::read(provider_state()?.join(name)) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),

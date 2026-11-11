@@ -13,6 +13,7 @@ import {
   ListItemIcon,
   ListItemText,
   Stack,
+  TextField,
   Typography,
 } from "@mui/material";
 import {
@@ -32,7 +33,20 @@ interface FileProviderIssueItemProps {
   onResolved: () => void;
 }
 
-type IssueAction = "save_copy" | "retry" | "discard";
+type IssueAction = "save_copy" | "retry" | "discard" | "undo_rename" | "rename" | "auto_fix";
+
+const FORBIDDEN_NAME_CHARS = /[\\/:*?"<>|]/;
+
+function nameError(name: string): string | null {
+  const trimmed = name.trim();
+  if (trimmed === "" || trimmed === "." || trimmed === "..") {
+    return "Enter a valid name";
+  }
+  if (FORBIDDEN_NAME_CHARS.test(trimmed)) {
+    return 'Names cannot contain \\ / : * ? " < > |';
+  }
+  return null;
+}
 
 export default function FileProviderIssueItem({
   issue,
@@ -42,15 +56,22 @@ export default function FileProviderIssueItem({
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [resolvingAction, setResolvingAction] = useState<IssueAction | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [newName, setNewName] = useState(issue.filename);
   const isManagedConflict = issue.source === "upload_conflict";
+  const isInvalidName = issue.kind === "invalid_name";
+  const newNameError = nameError(newName);
+  const canUndoRename =
+    !!issue.previous_name && nameError(issue.previous_name) === null;
 
-  const resolve = async (action: IssueAction) => {
+  const resolve = async (action: IssueAction, name?: string) => {
     setError(null);
     setResolvingAction(action);
     try {
       await invoke("resolve_file_provider_issue", {
         issueId: issue.id,
         action,
+        ...(name !== undefined ? { newName: name } : {}),
       });
       onResolved();
     } catch (error) {
@@ -169,14 +190,53 @@ export default function FileProviderIssueItem({
                       {resolvingAction === "save_copy" ? "Saving…" : "Save local copy"}
                     </Button>
                   )}
-                  <Button
-                    size="small"
-                    variant="outlined"
-                    disabled={busy}
-                    onClick={() => handleResolve("retry")}
-                  >
-                    {resolvingAction === "retry" ? "Retrying…" : `Retry ${issue.operation === "delete" ? "deletion" : issue.operation}`}
-                  </Button>
+                  {isInvalidName ? (
+                    <>
+                      {canUndoRename && (
+                        <Button
+                          size="small"
+                          variant="contained"
+                          disabled={busy}
+                          onClick={() => handleResolve("undo_rename")}
+                        >
+                          {resolvingAction === "undo_rename" ? "Renaming…" : "Undo rename"}
+                        </Button>
+                      )}
+                      <Button
+                        size="small"
+                        variant={canUndoRename ? "outlined" : "contained"}
+                        disabled={busy}
+                        onClick={() => handleResolve("auto_fix")}
+                        sx={{ textTransform: "none", maxWidth: "100%" }}
+                      >
+                        {resolvingAction === "auto_fix"
+                          ? "Renaming…"
+                          : issue.suggested_name
+                            ? `Fix: ${issue.suggested_name}`
+                            : "Auto-fix name"}
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        disabled={busy}
+                        onClick={() => {
+                          setNewName(issue.filename);
+                          setRenameOpen(true);
+                        }}
+                      >
+                        {resolvingAction === "rename" ? "Renaming…" : "Rename…"}
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={busy}
+                      onClick={() => handleResolve("retry")}
+                    >
+                      {resolvingAction === "retry" ? "Retrying…" : `Retry ${issue.operation === "delete" ? "deletion" : issue.operation}`}
+                    </Button>
+                  )}
                   {isManagedConflict && (
                     <Button
                       size="small"
@@ -200,6 +260,42 @@ export default function FileProviderIssueItem({
         }
       />
       </ListItem>
+      <Dialog open={renameOpen} onClose={() => setRenameOpen(false)}>
+        <DialogTitle>Rename item</DialogTitle>
+        <DialogContent>
+          <TextField
+            autoFocus
+            fullWidth
+            margin="dense"
+            size="small"
+            label="New name"
+            value={newName}
+            onChange={(event) => setNewName(event.target.value)}
+            error={newNameError !== null}
+            helperText={newNameError ?? " "}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && newNameError === null) {
+                event.preventDefault();
+                setRenameOpen(false);
+                void resolve("rename", newName.trim());
+              }
+            }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRenameOpen(false)}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={newNameError !== null}
+            onClick={() => {
+              setRenameOpen(false);
+              void resolve("rename", newName.trim());
+            }}
+          >
+            Rename
+          </Button>
+        </DialogActions>
+      </Dialog>
       <Dialog open={confirmRestore} onClose={() => setConfirmRestore(false)}>
         <DialogTitle>Restore from Cloudreve?</DialogTitle>
         <DialogContent>
