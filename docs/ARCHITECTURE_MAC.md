@@ -529,8 +529,9 @@ for both cursor and screen frames. It is then ordered on the clicked display
 with all-Spaces/full-screen auxiliary behavior. No primary-display scaling is
 applied to a secondary monitor.
 
-The macOS extension chunks local/relay uploads and attempts to cancel the session
-on an error. Build 193 records its own session IDs and URIs in SQLite before
+The macOS extension chunks local, relay and remote (slave node) uploads; other
+storage policies are refused. It sends the account token only to the instance
+origin, and it attempts to cancel the session on an error. Build 193 records its own session IDs and URIs in SQLite before
 uploading chunks. A local deletion cancels matching owned sessions in that
 subtree only after verifying the server still reports the same session ID.
 Failed cancellations remain recorded for a later deletion retry. Editor locks
