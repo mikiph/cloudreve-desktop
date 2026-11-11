@@ -295,7 +295,7 @@ impl Mount {
                     .drain(..)
                     .map(|event| crate::fileprovider::FpEventRecord {
                         ts: 0,
-                        event_type: format!("{:?}", event.event_type).to_lowercase(),
+                        event_type: crate::fileprovider::journal_type::for_server_event(&event.event_type).into(),
                         from: event.from,
                         to: event.to,
                         local_echo: false,
@@ -409,14 +409,14 @@ fn incremental_search_uri(root: &str, field: &str, since: i64) -> Result<String>
 fn incremental_event(file: &FileResponse, old: Option<&FileProviderRemoteItem>) -> Option<crate::fileprovider::FpEventRecord> {
     let uri = canonical_uri(&file.path);
     let kind = match old {
-        Some(old) if canonical_uri(&old.uri) != uri => "rename",
+        Some(old) if canonical_uri(&old.uri) != uri => crate::fileprovider::journal_type::RENAME,
         Some(old) if old.version == version(file) => return None,
-        _ => "modify", // Unknown items may already exist in Finder after migration.
+        _ => crate::fileprovider::journal_type::MODIFY, // Unknown items may already exist in Finder after migration.
     };
     Some(crate::fileprovider::FpEventRecord {
         ts: 0, event_type: kind.into(),
-        from: if kind == "rename" { old.unwrap().uri.clone() } else { uri.clone() },
-        to: if kind == "rename" { uri } else { String::new() }, local_echo: false, file_id: file.id.clone(),
+        from: if kind == crate::fileprovider::journal_type::RENAME { old.unwrap().uri.clone() } else { uri.clone() },
+        to: if kind == crate::fileprovider::journal_type::RENAME { uri } else { String::new() }, local_echo: false, file_id: file.id.clone(),
     })
 }
 

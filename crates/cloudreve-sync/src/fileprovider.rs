@@ -352,6 +352,38 @@ fn mark_download_retry(domain_id: &str, item_identifier: &str) -> Result<()> {
 
 // MARK: - Shared event log
 
+/// `type` values written to the fp_events journal. The Swift extension reads
+/// the same strings (`JournalEventType.swift`); both are checked against
+/// `macos/fileprovider/Tests/Fixtures/journal-event-types.txt`.
+pub mod journal_type {
+    pub const CREATE: &str = "create";
+    pub const MODIFY: &str = "modify";
+    pub const RENAME: &str = "rename";
+    pub const DELETE: &str = "delete";
+    pub const RESCAN: &str = "rescan";
+    pub const REFRESH_PRESENTED: &str = "refresh_presented";
+    pub const METADATA: &str = "metadata";
+    pub const METADATA_RESCAN: &str = "metadata_rescan";
+    pub const METADATA_NAME: &str = "metadata_name";
+    /// Every type the host writes.
+    pub const HOST_WRITTEN: [&str; 9] = [
+        CREATE, MODIFY, RENAME, DELETE, RESCAN, REFRESH_PRESENTED,
+        METADATA, METADATA_RESCAN, METADATA_NAME,
+    ];
+
+    /// Journal type for a server SSE event. Exhaustive on purpose: a new
+    /// server event variant must be mapped here before it can compile.
+    pub fn for_server_event(kind: &cloudreve_api::models::explorer::FileEventType) -> &'static str {
+        use cloudreve_api::models::explorer::FileEventType;
+        match kind {
+            FileEventType::Create => CREATE,
+            FileEventType::Modify => MODIFY,
+            FileEventType::Rename => RENAME,
+            FileEventType::Delete => DELETE,
+        }
+    }
+}
+
 /// One recorded remote event, stored transactionally in fileprovider.db.
 /// The File Provider extension replays the journal in enumerateChanges (it cannot run a
 /// long-lived SSE listener itself: XPC services get suspended when idle).
@@ -423,7 +455,7 @@ fn build_event_records(
     });
     marker.into_iter().chain(events.iter().map(|event| FpEventRecord {
         ts: 0,
-        event_type: format!("{:?}", event.event_type).to_lowercase(),
+        event_type: journal_type::for_server_event(&event.event_type).into(),
         from: event.from.clone(),
         to: event.to.clone(),
         local_echo: local_echo_paths.contains(&event.from) || (!event.to.is_empty() && local_echo_paths.contains(&event.to)),
@@ -434,23 +466,23 @@ fn build_event_records(
 /// A bounded refresh of root and recently presented folders. Does not expire
 /// the working-set anchor or recursively enumerate Keep Downloaded trees.
 pub fn append_presented_refresh(drive_id: &str) -> Result<()> {
-    append_state_events(drive_id, "refresh_presented", &[String::new()])
+    append_state_events(drive_id, journal_type::REFRESH_PRESENTED, &[String::new()])
 }
 
 pub fn append_rescan_marker(drive_id: &str) -> Result<()> {
-    append_state_events(drive_id, "rescan", &[String::new()])
+    append_state_events(drive_id, journal_type::RESCAN, &[String::new()])
 }
 
 pub fn append_metadata_events(drive_id: &str, source_uris: &[String]) -> Result<()> {
     if source_uris.is_empty() {
-        append_state_events(drive_id, "metadata_rescan", &[String::new()])
+        append_state_events(drive_id, journal_type::METADATA_RESCAN, &[String::new()])
     } else {
-        append_state_events(drive_id, "metadata", source_uris)
+        append_state_events(drive_id, journal_type::METADATA, source_uris)
     }
 }
 
 pub fn append_metadata_name_events(drive_id: &str, names: &[String]) -> Result<()> {
-    append_state_events(drive_id, "metadata_name", names)
+    append_state_events(drive_id, journal_type::METADATA_NAME, names)
 }
 
 fn append_state_events(drive_id: &str, kind: &str, paths: &[String]) -> Result<()> {
@@ -1482,5 +1514,24 @@ mod upload_receipt_tests {
         let mut records = build_event_records(Some("rescan"), &[], &Default::default());
         db.append_events_consuming("d", &mut records, &[]).unwrap();
         assert_eq!(db.latest_event_sequence("d").unwrap(), records[0].ts);
+    }
+
+    #[test]
+    fn journal_types_match_the_shared_fixture() {
+        let fixture = include_str!("../../../macos/fileprovider/Tests/Fixtures/journal-event-types.txt");
+        let mut host: Vec<&str> = fixture.lines()
+            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(_, writer)| *writer == "host")
+            .map(|(kind, _)| kind)
+            .collect();
+        host.sort_unstable();
+        let mut ours = super::journal_type::HOST_WRITTEN.to_vec();
+        ours.sort_unstable();
+        assert_eq!(ours, host, "update journal-event-types.txt and JournalEventType.swift together");
+        use cloudreve_api::models::explorer::FileEventType;
+        for kind in [FileEventType::Create, FileEventType::Modify, FileEventType::Rename, FileEventType::Delete] {
+            assert!(ours.contains(&super::journal_type::for_server_event(&kind)));
+        }
     }
 }

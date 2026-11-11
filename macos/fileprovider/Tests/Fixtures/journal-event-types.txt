@@ -1,0 +1,14 @@
+# Every `type` value that may appear in the fp_events journal payload.
+# Format: <type> <writer>. Writer is `host` (Rust app) or `extension` (Swift).
+# Both crates/cloudreve-sync (fileprovider.rs tests) and
+# macos/fileprovider/Tests/JournalEventTypeTests.swift check against this file.
+create host
+delete host
+metadata host
+metadata_name host
+metadata_rescan host
+modify host
+presented_page extension
+refresh_presented host
+rename host
+rescan host
