@@ -413,9 +413,9 @@ impl Mount {
             }
 
             let marker = if needs_rescan {
-                Some("rescan")
+                Some(crate::fileprovider::journal_type::RESCAN)
             } else if needs_presented_refresh {
-                Some("refresh_presented")
+                Some(crate::fileprovider::journal_type::REFRESH_PRESENTED)
             } else {
                 None
             };
