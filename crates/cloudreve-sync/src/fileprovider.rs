@@ -140,6 +140,18 @@ fn make_domain(id: &str, display_name: &str) -> Retained<NSFileProviderDomain> {
     }
 }
 
+/// Runs `f` with the domain's NSFileProviderManager inside an autorelease
+/// pool. Tokio worker threads have no pool, so autoreleased objects from
+/// these calls would otherwise live until the thread exits (never).
+/// Returns None when the system has no manager for the domain.
+fn with_manager<R>(domain: &NSFileProviderDomain, f: impl FnOnce(&AnyObject) -> R) -> Option<R> {
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let manager: Option<Retained<AnyObject>> =
+            msg_send![class!(NSFileProviderManager), managerForDomain: domain];
+        manager.map(|manager| f(&manager))
+    })
+}
+
 /// The raw value of `NSFileProviderRootContainerItemIdentifier`
 /// (used when signaling changes at the drive root).
 pub const ROOT_CONTAINER: &str = "NSFileProviderRootContainerItemIdentifier";
@@ -167,18 +179,13 @@ pub async fn user_visible_item_url(
                 let _ = tx.send(path);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return None;
-            }
+        with_manager(&domain, |manager| unsafe {
             let _: () = msg_send![
-                &*manager,
+                manager,
                 getUserVisibleURLForItemIdentifier: &*identifier,
                 completionHandler: &*block
             ];
-        }
+        })?;
     }
     tokio::time::timeout(Duration::from_secs(10), rx).await.ok()?.ok().flatten()
 }
@@ -498,13 +505,7 @@ fn append_state_events(drive_id: &str, kind: &str, paths: &[String]) -> Result<(
 /// changes (launching it if needed).
 pub fn signal_containers(domain_id: &str, display_name: &str, containers: &[String]) {
     let domain = make_domain(domain_id, display_name);
-    unsafe {
-        let manager: *mut AnyObject =
-            msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-        if manager.is_null() {
-            tracing::warn!(target: "fileprovider", "no NSFileProviderManager for domain {domain_id} (not registered?)");
-            return;
-        }
+    let found = with_manager(&domain, |manager| unsafe {
         for container in containers {
             let identifier = NSString::from_str(container);
             let container_log = container.clone();
@@ -517,11 +518,14 @@ pub fn signal_containers(domain_id: &str, display_name: &str, containers: &[Stri
                 }
             });
             let _: () = msg_send![
-                &*manager,
+                manager,
                 signalEnumeratorForContainerItemIdentifier: &*identifier,
                 completionHandler: &*block
             ];
         }
+    });
+    if found.is_none() {
+        tracing::warn!(target: "fileprovider", "no NSFileProviderManager for domain {domain_id} (not registered?)");
     }
 }
 
@@ -548,17 +552,15 @@ async fn signal_error_resolved(
                 let _ = tx.send(result);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
-            }
+        let sent = with_manager(&domain, |manager| unsafe {
             let _: () = msg_send![
-                &*manager,
+                manager,
                 signalErrorResolved: &*resolved_error,
                 completionHandler: &*block
             ];
+        });
+        if sent.is_none() {
+            return Err(anyhow!("no File Provider manager for domain {domain_id}"));
         }
     }
     await_completion(rx, FINDER_CALL_TIMEOUT, "the error resolution").await
@@ -628,19 +630,17 @@ pub async fn retry_item_upload(
                 let _ = tx.send(result);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
-            }
+        let sent = with_manager(&domain, |manager| unsafe {
             let _: () = msg_send![
-                &*manager,
+                manager,
                 requestModificationOfFields: 1usize,
                 forItemWithIdentifier: &*identifier,
                 options: 0usize,
                 completionHandler: &*block
             ];
+        });
+        if sent.is_none() {
+            return Err(anyhow!("no File Provider manager for domain {domain_id}"));
         }
     }
     await_completion(rx, FINDER_CALL_TIMEOUT, "the upload retry").await
@@ -671,19 +671,17 @@ pub async fn retry_item_download(
                 let _ = tx.send(result);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
-            }
+        let sent = with_manager(&domain, |manager| unsafe {
             let full_file = NSRange::new(isize::MAX as usize, 0);
             let _: () = msg_send![
-                &*manager,
+                manager,
                 requestDownloadForItemWithIdentifier: &*identifier,
                 requestedRange: full_file,
                 completionHandler: &*block
             ];
+        });
+        if sent.is_none() {
+            return Err(anyhow!("no File Provider manager for domain {domain_id}"));
         }
     }
     await_completion(rx, FINDER_CALL_TIMEOUT, "the download retry").await
@@ -1037,12 +1035,12 @@ async fn list_domain_states() -> Result<Vec<(String, String, bool, bool)>> {
                 }
             },
         );
-        unsafe {
+        objc2::rc::autoreleasepool(|_| unsafe {
             let _: () = msg_send![
                 class!(NSFileProviderManager),
                 getDomainsWithCompletionHandler: &*block
             ];
-        }
+        });
     }
     tokio::time::timeout(Duration::from_secs(10), rx).await
         .map_err(|_| anyhow!("Finder did not respond when listing domains"))?
@@ -1066,13 +1064,13 @@ pub async fn add_domain(domain_id: &str, display_name: &str) -> Result<()> {
                 let _ = tx.send(result);
             }
         });
-        unsafe {
+        objc2::rc::autoreleasepool(|_| unsafe {
             let _: () = msg_send![
                 class!(NSFileProviderManager),
                 addDomain: &*domain,
                 completionHandler: &*block
             ];
-        }
+        });
     }
     await_completion(rx, DOMAIN_LIFECYCLE_TIMEOUT, "adding the Finder location").await
 }
@@ -1102,7 +1100,7 @@ pub async fn remove_domain(domain_id: &str, display_name: &str) -> Result<Option
                 }
             },
         );
-        unsafe {
+        objc2::rc::autoreleasepool(|_| unsafe {
             // NSFileProviderDomainRemovalModePreserveDirtyUserData = 1
             let _: () = msg_send![
                 class!(NSFileProviderManager),
@@ -1110,7 +1108,7 @@ pub async fn remove_domain(domain_id: &str, display_name: &str) -> Result<Option
                 mode: 1isize,
                 completionHandler: &*block
             ];
-        }
+        });
     }
     await_completion(rx, DOMAIN_LIFECYCLE_TIMEOUT, "removing the Finder location").await
 }
@@ -1134,23 +1132,21 @@ pub async fn set_domain_connected(domain_id: &str, display_name: &str, connected
                 let _ = tx.send(result);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
-            }
+        let sent = with_manager(&domain, |manager| unsafe {
             if connected {
-                let _: () = msg_send![&*manager, reconnectWithCompletionHandler: &*block];
+                let _: () = msg_send![manager, reconnectWithCompletionHandler: &*block];
             } else {
                 let reason = NSString::from_str(reason);
                 let _: () = msg_send![
-                    &*manager,
+                    manager,
                     disconnectWithReason: &*reason,
                     options: 0usize,
                     completionHandler: &*block
                 ];
             }
+        });
+        if sent.is_none() {
+            return Err(anyhow!("no File Provider manager for domain {domain_id}"));
         }
     }
     tokio::time::timeout(Duration::from_secs(10), rx).await
