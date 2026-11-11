@@ -241,7 +241,7 @@ extension RemoteStore {
         return cache.mapValues { $0.itemVersion }
     }
 
-    private func identityMapsSnapshot() -> (
+    func identityMapsSnapshot() -> (
         byIdentifier: [String: String], byURI: [String: String]
     ) {
         cacheLock.lock()
@@ -251,7 +251,7 @@ extension RemoteStore {
 
     /// The parent index is maintained with the identity maps. Candidate seeding
     /// visits this folder's children instead of scanning every known drive item.
-    private func immediateIdentityChildren(of uri: String) -> [(String, String)] {
+    func immediateIdentityChildren(of uri: String) -> [(String, String)] {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return (identityChildrenByParent[uri] ?? []).compactMap { identifier in
@@ -314,7 +314,7 @@ extension RemoteStore {
         return (updated, deleted)
     }
 
-    private func allChildren(
+    func allChildren(
         of identifier: NSFileProviderItemIdentifier
     ) async throws -> [FileProviderItem] {
         var result: [FileProviderItem] = []

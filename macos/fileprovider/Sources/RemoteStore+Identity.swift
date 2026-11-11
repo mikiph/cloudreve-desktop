@@ -43,7 +43,7 @@ extension RemoteStore {
         return NSFileProviderItemIdentifier(own)
     }
 
-    private func identifier(
+    func identifier(
         for file: RemoteFile,
         preserving preserved: NSFileProviderItemIdentifier? = nil
     ) -> NSFileProviderItemIdentifier {
@@ -64,7 +64,7 @@ extension RemoteStore {
             file.presentationIdentity ?? ItemIdentity.remoteID(file.id, fallbackURI: uri))
     }
 
-    private func recordIdentity(_ identifier: NSFileProviderItemIdentifier, uri: String, isFolder: Bool, persist: Bool) {
+    func recordIdentity(_ identifier: NSFileProviderItemIdentifier, uri: String, isFolder: Bool, persist: Bool) {
         let uri = Self.canonicalURI(uri)
         cacheLock.lock()
         if let existing = identifierByURI[uri], existing != identifier.rawValue {
@@ -169,7 +169,7 @@ extension RemoteStore {
     /// All identities under `uri`, found via the parent index keys (one per
     /// distinct parent folder) so unindexed intermediate folders are covered.
     /// Call with `cacheLock` held.
-    private func descendantIdentifiers(of uri: String) -> Set<String> {
+    func descendantIdentifiers(of uri: String) -> Set<String> {
         let prefix = uri + "/"
         var result = Set<String>()
         for (parent, children) in identityChildrenByParent where parent == uri || parent.hasPrefix(prefix) {
@@ -178,13 +178,13 @@ extension RemoteStore {
         return result
     }
 
-    private func currentIdentityRevision() -> UInt64 {
+    func currentIdentityRevision() -> UInt64 {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return identityRevision
     }
 
-    private func persistIdentityBatch(since revision: UInt64) {
+    func persistIdentityBatch(since revision: UInt64) {
         guard currentIdentityRevision() != revision else { return }
         persistIdentitySnapshot([:])
         persistDeletedIdentitySnapshot([:])
@@ -265,7 +265,7 @@ extension RemoteStore {
         cacheLock.unlock()
     }
 
-    private func isLockActive(for uri: String) -> Bool {
+    func isLockActive(for uri: String) -> Bool {
         let itemURI = Self.canonicalURI(uri)
         cacheLock.lock()
         defer { cacheLock.unlock() }
@@ -302,11 +302,11 @@ extension RemoteStore {
     }
 
     /// Canonical URI of the drive root.
-    private var rootPath: String {
+    var rootPath: String {
         Self.canonicalURI(drive.remote_path)
     }
 
-    private func parentPath(of path: String) -> String {
+    func parentPath(of path: String) -> String {
         var p = path
         if p.hasSuffix("/") { p.removeLast() }
         guard let idx = p.lastIndex(of: "/") else { return rootPath }

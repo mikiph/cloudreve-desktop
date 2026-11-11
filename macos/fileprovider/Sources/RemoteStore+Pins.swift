@@ -13,13 +13,13 @@ extension RemoteStore {
         return pinnedIdentifiers.contains(identifier.rawValue)
     }
 
-    private func pinnedIdentifiersSnapshot() -> Set<String> {
+    func pinnedIdentifiersSnapshot() -> Set<String> {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return pinnedIdentifiers
     }
 
-    private func cachedItem(
+    func cachedItem(
         for identifier: NSFileProviderItemIdentifier
     ) -> FileProviderItem? {
         cacheLock.lock()
@@ -27,7 +27,7 @@ extension RemoteStore {
         return cache[identifier.rawValue]
     }
 
-    private func metadataIsFresh(
+    func metadataIsFresh(
         for identifier: NSFileProviderItemIdentifier
     ) -> Bool {
         cacheLock.lock()
@@ -77,7 +77,7 @@ extension RemoteStore {
     }
 
     /// Pending policy updates for working-set enumeration.
-    private var pendingPolicyUpdatesFileURL: URL {
+    var pendingPolicyUpdatesFileURL: URL {
         stateDirectoryURL.appendingPathComponent("pending-pinned-\(drive.id).json")
     }
 
@@ -110,7 +110,7 @@ extension RemoteStore {
         return Set(saved)
     }
 
-    private func pendingItemUpdatesSnapshot() -> Set<String> {
+    func pendingItemUpdatesSnapshot() -> Set<String> {
         pendingPolicyUpdatesLock.lock()
         defer { pendingPolicyUpdatesLock.unlock() }
         return readPendingPolicyUpdates()
@@ -585,7 +585,7 @@ extension RemoteStore {
         }
     }
 
-    private func persistPins(_ snapshot: [String]) {
+    func persistPins(_ snapshot: [String]) {
         do {
             try FileManager.default.createDirectory(
                 at: pinnedFileURL.deletingLastPathComponent(),

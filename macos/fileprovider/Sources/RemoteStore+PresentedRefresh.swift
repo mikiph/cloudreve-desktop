@@ -44,7 +44,7 @@ extension RemoteStore {
         var folders_checked: Int? = nil
     }
 
-    private func refreshDatabase() throws -> FileProviderStateDatabase {
+    func refreshDatabase() throws -> FileProviderStateDatabase {
         try FileProviderStateDatabase(root: stateDirectoryOverride ?? FileProviderStateDatabase.defaultRoot)
     }
 
@@ -480,7 +480,7 @@ extension RemoteStore {
         try savePresentedRefresh(state, to: database)
     }
 
-    private func hasUnappliedFolderMove(_ database: FileProviderStateDatabase) throws -> Bool {
+    func hasUnappliedFolderMove(_ database: FileProviderStateDatabase) throws -> Bool {
         let payload = try database.rows("SELECT payload FROM fp_records WHERE namespace='fp-applied' AND key=?", [drive.id]).first?.first
         let applied = payload.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Int64] }?["sequence"] ?? 0
         return try !database.rows("SELECT sequence FROM fp_events WHERE drive=? AND sequence>? AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.type') END='rename' LIMIT 1", [drive.id, String(applied)]).isEmpty

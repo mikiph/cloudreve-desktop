@@ -4,7 +4,7 @@ import OSLog
 import UniformTypeIdentifiers
 import CryptoKit
 
-private actor OperationGate {
+actor OperationGate {
     private var available = true
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -28,7 +28,7 @@ private actor OperationGate {
     }
 }
 
-private actor MetadataRefreshCoordinator {
+actor MetadataRefreshCoordinator {
     private var inFlight: [String: Task<RemoteFile, Error>] = [:]
 
     func run(
@@ -54,32 +54,32 @@ private actor MetadataRefreshCoordinator {
 
 /// Maps a File Provider domain to a Cloudreve drive.
 final class RemoteStore {
-    private let logger = Logger(
+    let logger = Logger(
         subsystem: "cloudreve.desktop.fileprovider", category: "store")
 
     let drive: DriveConfig
     let client: CloudreveClient
-    private let domain: NSFileProviderDomain
+    let domain: NSFileProviderDomain
 
     /// itemIdentifier.rawValue -> item.
-    private var cache: [String: FileProviderItem] = [:]
+    var cache: [String: FileProviderItem] = [:]
     /// Stable Finder identity -> current Cloudreve URI.
-    private var uriByIdentifier: [String: String] = [:]
-    private var identifierByURI: [String: String] = [:]
-    private var identityChildrenByParent: [String: Set<String>] = [:]
-    private var identityRevision: UInt64 = 0
+    var uriByIdentifier: [String: String] = [:]
+    var identifierByURI: [String: String] = [:]
+    var identityChildrenByParent: [String: Set<String>] = [:]
+    var identityRevision: UInt64 = 0
     // While a batch is open, identity changes are persisted once when the last
     // batch closes instead of rewriting the whole snapshot for every item.
     // Guarded by cacheLock.
-    private var identityBatchDepth = 0
-    private var identityBatchDirty = false
-    private var identityBatchDeletedDirty = false
-    private var identityBatchPinsDirty = false
+    var identityBatchDepth = 0
+    var identityBatchDirty = false
+    var identityBatchDeletedDirty = false
+    var identityBatchPinsDirty = false
     private let identityPersistenceLock = NSLock()
     /// Explicitly pinned identifiers, persisted per drive.
-    private var pinnedIdentifiers: Set<String> = []
-    private var pinRevision: UInt64 = 0
-    private var pinRevisionByIdentifier: [String: UInt64] = [:]
+    var pinnedIdentifiers: Set<String> = []
+    var pinRevision: UInt64 = 0
+    var pinRevisionByIdentifier: [String: UInt64] = [:]
 
     struct PinChange {
         let wasPinned: Bool
@@ -87,49 +87,49 @@ final class RemoteStore {
     }
     /// Stable identities confirmed absent remotely. Finder may replay these
     /// as create callbacks after a domain is re-registered.
-    private var deletedIdentityURIs: [String: String] = [:]
+    var deletedIdentityURIs: [String: String] = [:]
     /// Deletion time (ms since epoch) per tombstone; guarded by cacheLock.
-    private var deletedIdentityTimes: [String: Int64] = [:]
+    var deletedIdentityTimes: [String: Int64] = [:]
     static let tombstoneRetention: TimeInterval = 30 * 24 * 3600
     static var tombstoneLimit = 50_000
     var tombstoneClock: () -> Date = Date.init
     /// Version marker used to force a working-set refresh after policy changes.
     private static let policyMetadataVersion = "finder-metadata-v8-sharing-sentence-case"
-    private static let metadataRefreshTTL: TimeInterval = 5
-    private static let lockStateTTL: TimeInterval = 30
-    private var policyRescanPending = false
-    private var metadataRefreshAt: [String: Date] = [:]
-    private var lockExpiryByURI: [String: Date] = [:]
-    private var presentedContainers: [String: UInt64] = [:]
-    private var presentedContainerSequence: UInt64 = 0
-    private var remoteDeleteGenerationByURI: [String: UInt64] = [:]
+    static let metadataRefreshTTL: TimeInterval = 5
+    static let lockStateTTL: TimeInterval = 30
+    var policyRescanPending = false
+    var metadataRefreshAt: [String: Date] = [:]
+    var lockExpiryByURI: [String: Date] = [:]
+    var presentedContainers: [String: UInt64] = [:]
+    var presentedContainerSequence: UInt64 = 0
+    var remoteDeleteGenerationByURI: [String: UInt64] = [:]
     private var pendingStabilizationDeletes: Set<String> = []
     // Reconnect reconciliation only walks containers Finder has presented.
     // Eight entries is too small for normal use and lets quiet folders fall
     // out of recovery coverage, so missed SSE creates can remain invisible.
     // Keep this bounded to avoid turning a reconnect into a full-drive crawl.
-    private static let presentedContainerLimit = 128
-    private let cacheLock = NSLock()
+    static let presentedContainerLimit = 128
+    let cacheLock = NSLock()
     /// Serializes the read-modify-write of pending-pinned-<drive>.json.
     /// Never take cacheLock while holding this lock, or the reverse.
-    private let pendingPolicyUpdatesLock = NSLock()
-    private let pinRequestLock = NSLock()
-    private let stateDirectoryOverride: URL?
-    private let pinRequestDirectoryOverride: URL?
+    let pendingPolicyUpdatesLock = NSLock()
+    let pinRequestLock = NSLock()
+    let stateDirectoryOverride: URL?
+    let pinRequestDirectoryOverride: URL?
     private let actionGate = OperationGate()
     private let managerCallGate = OperationGate()
-    private let metadataRefreshCoordinator = MetadataRefreshCoordinator()
-    private let migrationRecoveryGate = OperationGate()
-    private var migrationRecoveryCompleted = false
-    private let presentedRefreshLock = NSLock()
-    private var presentedRefreshRunning = false
-    private let downloadedRefreshLock = NSLock()
-    private var downloadedRefreshRunning = false
-    private var downloadedRefreshPending: Set<String> = []
-    private let presentedPageLoader: ((String, String?) async throws -> CloudreveClient.ListResult)?
+    let metadataRefreshCoordinator = MetadataRefreshCoordinator()
+    let migrationRecoveryGate = OperationGate()
+    var migrationRecoveryCompleted = false
+    let presentedRefreshLock = NSLock()
+    var presentedRefreshRunning = false
+    let downloadedRefreshLock = NSLock()
+    var downloadedRefreshRunning = false
+    var downloadedRefreshPending: Set<String> = []
+    let presentedPageLoader: ((String, String?) async throws -> CloudreveClient.ListResult)?
     private let workingSetSignaller: (() async throws -> Void)?
-    private let presentedMissingLookup: ((String) async throws -> RemoteFile)?
-    private let downloadedContentRefresher: ((NSFileProviderItemIdentifier) async -> Void)?
+    let presentedMissingLookup: ((String) async throws -> RemoteFile)?
+    let downloadedContentRefresher: ((NSFileProviderItemIdentifier) async -> Void)?
 
     // MARK: - Change feed (shared event log)
 
@@ -155,7 +155,7 @@ final class RemoteStore {
     /// Keep each File Provider callback short.  macOS immediately requests
     /// the next page when `moreComing` is true, so a large recovery delta
     /// cannot monopolize the extension or delay newer changes.
-    private static let changePageSize = 100
+    static let changePageSize = 100
 
     init(drive: DriveConfig, domain: NSFileProviderDomain,
          stateDirectory: URL? = nil, pinRequestDirectory: URL? = nil,
@@ -248,7 +248,7 @@ final class RemoteStore {
         }
     }
 
-    private var stateDirectoryURL: URL {
+    var stateDirectoryURL: URL {
         if let stateDirectoryOverride { return stateDirectoryOverride }
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
@@ -257,11 +257,11 @@ final class RemoteStore {
             .appendingPathComponent("CloudreveFileProvider", isDirectory: true)
     }
 
-    private var pinnedFileURL: URL {
+    var pinnedFileURL: URL {
         stateDirectoryURL.appendingPathComponent("pinned-\(drive.id).json")
     }
 
-    private var identityFileURL: URL {
+    var identityFileURL: URL {
         stateDirectoryURL
             .appendingPathComponent("identities-\(drive.id).json")
     }
@@ -276,7 +276,7 @@ final class RemoteStore {
             .appendingPathComponent("deleted-identities-\(drive.id).times.json")
     }
 
-    private func tombstoneNowMillis() -> Int64 {
+    func tombstoneNowMillis() -> Int64 {
         Int64(tombstoneClock().timeIntervalSince1970 * 1000)
     }
 
@@ -302,7 +302,7 @@ final class RemoteStore {
         }
     }
 
-    private var presentedFileURL: URL {
+    var presentedFileURL: URL {
         stateDirectoryURL
             .appendingPathComponent("presented-\(drive.id).json")
     }
@@ -317,7 +317,7 @@ final class RemoteStore {
             .appendingPathComponent("policy-rescan-\(drive.id).marker")
     }
 
-    private var resetAcknowledgementURL: URL {
+    var resetAcknowledgementURL: URL {
         stateDirectoryURL
             .appendingPathComponent("reset-applied-\(drive.id).marker")
     }
@@ -349,7 +349,7 @@ final class RemoteStore {
         logger.notice("cleared local File Provider state for drive reset")
     }
 
-    private func persistIdentitySnapshot(_ snapshot: [String: String]) {
+    func persistIdentitySnapshot(_ snapshot: [String: String]) {
         // Snapshot only after taking the writer lock. Concurrent callbacks must
         // never overwrite a newer move with an older snapshot captured earlier.
         identityPersistenceLock.lock()
@@ -367,7 +367,7 @@ final class RemoteStore {
         }
     }
 
-    private func persistDeletedIdentitySnapshot(_ snapshot: [String: String]) {
+    func persistDeletedIdentitySnapshot(_ snapshot: [String: String]) {
         identityPersistenceLock.lock()
         defer { identityPersistenceLock.unlock() }
         cacheLock.lock()
@@ -402,7 +402,7 @@ final class RemoteStore {
         }
     }
 
-    private func withManagerCall<T>(_ operation: () async throws -> T) async rethrows -> T {
+    func withManagerCall<T>(_ operation: () async throws -> T) async rethrows -> T {
         await managerCallGate.acquire()
         do {
             let result = try await operation()
@@ -446,7 +446,7 @@ final class RemoteStore {
         }
     }
 
-    private func persistPolicyRescanMarker() {
+    func persistPolicyRescanMarker() {
         do {
             try FileManager.default.createDirectory(
                 at: policyRescanMarkerURL.deletingLastPathComponent(),

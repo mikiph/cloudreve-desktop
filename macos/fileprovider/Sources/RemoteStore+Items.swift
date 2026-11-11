@@ -309,7 +309,7 @@ extension RemoteStore {
         }
     }
 
-    private func presentedContainersSnapshot() -> [NSFileProviderItemIdentifier] {
+    func presentedContainersSnapshot() -> [NSFileProviderItemIdentifier] {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return presentedContainers
