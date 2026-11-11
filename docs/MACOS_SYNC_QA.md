@@ -80,6 +80,28 @@ menu icon on each display, including a different Space and a full-screen app.
 The popup must appear below that display's menu bar without switching to its
 previous Space. Check edge clamping, second-click dismissal and ordinary blur.
 
+## Storage policies (slave node and unsupported)
+
+Finder uploads go through the Cloudreve instance for local and relay policies,
+and directly to the slave node for remote policies. Other policies are refused.
+The slave-node path is covered only by a mocked test (`UploadOriginTests`), so
+record the first real run here.
+
+1. On a server with a remote (slave node) storage policy on a different host
+   or port than the instance, point a test folder at that policy. Copy a small
+   file and a file larger than one chunk into it through Finder. Both must
+   finish uploading, open from the Cloudreve website, and keep their size.
+2. In the slave node's access log, confirm chunk requests carry the upload
+   session credential in `Authorization` and never a `Bearer` account token.
+   Do not paste credential values into bug reports.
+3. Delete one of those files in Finder during a large upload. The upload must
+   stop and the server must not keep an orphan session for it.
+4. Point a folder at an S3 (or other direct-to-storage) policy and copy a file
+   into it. Finder must show the error "This storage policy (…) is not
+   supported by the macOS Finder integration. Upload the file from the
+   Cloudreve website instead." No request may reach the storage host.
+5. Record the server version, policy types, and app/extension build numbers.
+
 ## Upload interruption limitation
 
 Uploads are chunked, but neither the macOS extension nor the Rust uploader

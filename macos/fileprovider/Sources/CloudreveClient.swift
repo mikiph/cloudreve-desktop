@@ -815,7 +815,8 @@ final class CloudreveClient {
 
     /// Uploads the local file to `uri`. When `overwrite` is true, the content
     /// becomes a new version of the existing file at `uri`.
-    /// Works for local/relay storage policies (server-side completion).
+    /// Works for local, relay and remote (slave node) storage policies, which all complete server-side.
+    /// Other policies throw `CloudreveError.unsupportedStoragePolicy` from `uploadChunk`.
     func uploadFile(
         at uri: String,
         from fileURL: URL,
