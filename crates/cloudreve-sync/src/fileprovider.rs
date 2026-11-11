@@ -52,7 +52,7 @@ async fn await_completion<T>(
     what: &str,
 ) -> Result<T> {
     match tokio::time::timeout(limit, rx).await {
-        Err(_) => Err(anyhow!("Finder did not respond to {what} within {} seconds. Try again; nothing was changed by Cloudreve.", limit.as_secs())),
+        Err(_) => Err(anyhow!("Finder did not respond to {what} within {} seconds. macOS may still finish it in the background; check Finder before trying again.", limit.as_secs())),
         Ok(Err(_)) => Err(anyhow!("{what} callback dropped")),
         Ok(Ok(result)) => result,
     }
@@ -1398,6 +1398,8 @@ mod lifecycle_tests {
         let (_tx, rx) = oneshot::channel::<Result<()>>();
         let error = await_completion(rx, Duration::from_millis(50), "test").await.unwrap_err();
         assert!(error.to_string().contains("did not respond"));
+        assert!(!error.to_string().contains("nothing was changed"));
+        assert!(error.to_string().contains("may still finish"));
     }
 
     #[tokio::test]
