@@ -37,6 +37,19 @@ pub struct StateDb {
     root: PathBuf,
 }
 
+/// Run synchronous state-database work on tokio's blocking pool. Opening the
+/// shared database takes a write lock and may wait up to busy_timeout while the
+/// extension writes; never do that on an async worker thread.
+pub async fn run_blocking<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .context("File Provider state task did not complete")?
+}
+
 impl StateDb {
     /// Only legacy metadata owned by this migration is eligible. Never recurse:
     /// user content, backups, symlinks and unknown files must survive upgrades.
@@ -325,6 +338,40 @@ fn insert_event(tx: &mut SqliteConnection, drive: &str, event: &FpEventRecord) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_does_not_stall_the_async_thread() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let value = run_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(7)
+        })
+        .await
+        .unwrap();
+        ticker.abort();
+        assert_eq!(value, 7);
+        // On a current-thread runtime the ticker can only run if the work left this thread.
+        assert!(ticks.load(Ordering::Relaxed) >= 5, "async thread was blocked");
+    }
+
+    #[tokio::test]
+    async fn run_blocking_passes_errors_through() {
+        let error = run_blocking::<(), _>(|| Err(anyhow::anyhow!("busy")))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "busy");
+    }
 
     #[derive(QueryableByName)]
     struct ObjectName {

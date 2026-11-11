@@ -951,10 +951,22 @@ impl Mount {
             // The first poll establishes the baseline and repairs stale share
             // flags left behind by a previous process.
             #[cfg(target_os = "macos")]
-            let mut known: Option<std::collections::BTreeMap<String, String>> = crate::fileprovider_db::StateDb::open()
-                .and_then(|mut db| db.records("fp-share-state")).ok()
-                .and_then(|records| records.into_iter().find(|record| record.key == format!("{mount_id}.json")))
-                .and_then(|record| serde_json::from_str(&record.payload).ok());
+            let mut known: Option<std::collections::BTreeMap<String, String>> = {
+                let id = mount_id.clone();
+                crate::fileprovider_db::run_blocking(move || {
+                    crate::fileprovider_db::StateDb::open()
+                        .and_then(|mut db| db.records("fp-share-state"))
+                        .map(|records| {
+                            records
+                                .into_iter()
+                                .find(|record| record.key == format!("{id}.json"))
+                        })
+                })
+                .await
+                .ok()
+                .flatten()
+                .and_then(|record| serde_json::from_str(&record.payload).ok())
+            };
             // Windows deliberately starts without a persisted baseline. The
             // first pass repairs Explorer state for Web UI changes made while
             // the desktop client was not running.
@@ -1023,15 +1035,18 @@ impl Mount {
                                     names.insert(name.clone());
                                 }
                             }
-                            crate::fileprovider::append_metadata_name_events(
-                                &mount_id,
-                                &names.into_iter().collect::<Vec<_>>(),
-                            )
+                            let names = names.into_iter().collect::<Vec<String>>();
+                            let id = mount_id.clone();
+                            crate::fileprovider_db::run_blocking(move || {
+                                crate::fileprovider::append_metadata_name_events(&id, &names)
+                            })
+                            .await
                         } else {
-                            crate::fileprovider::append_metadata_events(
-                                &mount_id,
-                                &[],
-                            )
+                            let id = mount_id.clone();
+                            crate::fileprovider_db::run_blocking(move || {
+                                crate::fileprovider::append_metadata_events(&id, &[])
+                            })
+                            .await
                         };
                         if let Err(error) = recorded {
                             tracing::warn!(target: "fileprovider", %error, "Retrying share change journal write");
@@ -1060,9 +1075,13 @@ impl Mount {
                 known = Some(shares);
                 #[cfg(target_os = "macos")]
                 if let Some(current) = &known {
-                    let result = crate::fileprovider_db::StateDb::open().and_then(|mut db| {
-                        db.put("fp-share-state", &format!("{mount_id}.json"), &serde_json::to_string(current)?)
-                    });
+                    let (id, current) = (mount_id.clone(), current.clone());
+                    let result = crate::fileprovider_db::run_blocking(move || {
+                        crate::fileprovider_db::StateDb::open().and_then(|mut db| {
+                            db.put("fp-share-state", &format!("{id}.json"), &serde_json::to_string(&current)?)
+                        })
+                    })
+                    .await;
                     if let Err(error) = result {
                         tracing::warn!(target: "fileprovider", %error, "Could not persist share baseline");
                     }

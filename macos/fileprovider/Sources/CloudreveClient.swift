@@ -51,7 +51,7 @@ enum DriveStore {
             return drive
         } catch {
             logger.error(
-                "failed to read \(drivesURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                "failed to read \(drivesURL.path, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
             )
             return nil
         }
@@ -815,7 +815,8 @@ final class CloudreveClient {
 
     /// Uploads the local file to `uri`. When `overwrite` is true, the content
     /// becomes a new version of the existing file at `uri`.
-    /// Works for local/relay storage policies (server-side completion).
+    /// Works for local, relay and remote (slave node) storage policies, which all complete server-side.
+    /// Other policies throw `CloudreveError.unsupportedStoragePolicy` from `uploadChunk`.
     func uploadFile(
         at uri: String,
         from fileURL: URL,
@@ -895,7 +896,7 @@ final class CloudreveClient {
             throw error
         }
         try FileProviderStateDatabase().remove("fileprovider-upload-sessions", sessionKey)
-        logger.info("uploaded \(uri, privacy: .public) (\(size) bytes, chunks ok)")
+        logger.info("uploaded \(uri, privacy: .private(mask: .hash)) (\(size) bytes, chunks ok)")
     }
 
     private func cancelUploadSession(credential: UploadCredentialPayload, uri: String)

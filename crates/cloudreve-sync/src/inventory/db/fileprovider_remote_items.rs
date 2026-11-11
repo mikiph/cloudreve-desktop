@@ -114,7 +114,7 @@ impl InventoryDb {
                         .into_iter()
                         .map(|item| crate::fileprovider::FpEventRecord {
                             ts: 0,
-                            event_type: "delete".into(),
+                            event_type: crate::fileprovider::journal_type::DELETE.into(),
                             from: item.uri,
                             to: String::new(),
                             local_echo: false,

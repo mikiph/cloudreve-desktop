@@ -158,8 +158,9 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
     }
 
     #[cfg(target_os = "macos")]
-    match cloudreve_sync::fileprovider_db::StateDb::open()
-        .and_then(|mut db| db.migrate_and_cleanup()) {
+    match cloudreve_sync::fileprovider_db::run_blocking(|| {
+        cloudreve_sync::fileprovider_db::StateDb::open().and_then(|mut db| db.migrate_and_cleanup())
+    }).await {
         Ok(count) => tracing::info!(count, "Migrated legacy File Provider state"),
         Err(error) => tracing::warn!(%error, "Legacy state retained; migration will retry next launch"),
     }
@@ -206,6 +207,9 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
                     let drives = manager.list_drives().await;
                     applied.retain(|id, _| drives.iter().any(|drive| &drive.id == id));
                     for drive in drives.iter().filter(|drive| drive.enabled) {
+                        // shutdown() stops waiting for this lock after 15 s and disconnects every
+                        // domain itself. Never reconnect a domain after that has started.
+                        if SHUTDOWN_STARTED.load(Ordering::Acquire) { break; }
                         let Some(mount) = manager.get_drive(&drive.id).await else { continue; };
                         let flags = mount.get_status_flags().await;
                         let connected = flags.is_event_push_subscribed() && !flags.is_credential_expired();
@@ -213,7 +217,10 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
                         // refresh pages. Wake existing work without adding a
                         // new marker or repeating the server search.
                         if connected && applied.get(&drive.id) == Some(&true) {
-                            if let Err(error) = cloudreve_sync::fileprovider::wake_pending_refresh(&drive.id, &drive.name) {
+                            let (id, name) = (drive.id.clone(), drive.name.clone());
+                            if let Err(error) = cloudreve_sync::fileprovider_db::run_blocking(move || {
+                                cloudreve_sync::fileprovider::wake_pending_refresh(&id, &name)
+                            }).await {
                                 tracing::warn!(target: "fileprovider", %error, id=%drive.id, "Could not resume pending Finder checks");
                             }
                         }
@@ -223,6 +230,9 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
                         } else {
                             "Cloudreve is reconnecting to the server. Check your internet connection. Syncing resumes automatically."
                         };
+                        // shutdown() stops waiting for this lock after 15 s and disconnects every
+                        // domain itself. Never reconnect a domain after that has started.
+                        if SHUTDOWN_STARTED.load(Ordering::Acquire) { break; }
                         match cloudreve_sync::fileprovider::set_domain_connected(
                             &cloudreve_sync::fileprovider::domain_identifier(&drive.id),
                             &drive.name, connected, reason,

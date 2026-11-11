@@ -227,16 +227,19 @@ impl Mount {
             .into_iter()
             .map(|item| (item.remote_id.clone(), item))
             .collect::<HashMap<_, _>>();
-        // An empty inventory means this is the first audit after installing a
-        // version with persistent recovery state.  The remote tree is a
-        // baseline, not thousands of newly-created Finder items.  Visible
-        // folders are reconciled separately when the SSE stream reconnects;
-        // subsequent audits can then emit precise deltas against this
-        // snapshot.
-        let establishing_baseline = previous.is_empty();
+        // The inventory is complete only if a previous Full check finished for
+        // this root and its rows are still present.  Otherwise it holds just
+        // what incremental searches returned, so unknown items are not "new";
+        // enumeration and the closing rescan marker cover them.
+        let inventory_complete = inventory_is_complete(
+            read_baseline(&mut crate::fileprovider_db::StateDb::open()?, &drive_id)?.as_ref(),
+            &root_uri,
+            &previous,
+        );
+        let baseline_root = root_uri.clone();
 
         let server_started = self.cr_client.server_time().await.ok();
-        tracing::info!(target: "fileprovider_audit", id=%drive_id, known=previous.len(), "Starting metadata-only File Provider recovery audit");
+        tracing::info!(target: "fileprovider_audit", id=%drive_id, known=previous.len(), inventory_complete, "Starting metadata-only File Provider recovery audit");
         let mut queue = VecDeque::from([root_uri]);
         let mut visited = HashSet::new();
         let mut events = Vec::new();
@@ -260,13 +263,7 @@ impl Mount {
                     let uri = canonical_uri(&file.path);
                     let item_version = version(&file);
                     let old = previous.get(&file.id);
-                    let event_type = match old {
-                        None => Some(FileEventType::Create),
-                        Some(old) if canonical_uri(&old.uri) != uri => Some(FileEventType::Rename),
-                        Some(old) if old.version != item_version => Some(FileEventType::Modify),
-                        _ => None,
-                    };
-                    if !establishing_baseline && let Some(event_type) = event_type {
+                    if let Some(event_type) = full_check_event_type(old, &uri, &item_version, inventory_complete) {
                         events.push(FileEventData {
                             event_type,
                             file_id: file.id.clone(),
@@ -298,7 +295,7 @@ impl Mount {
                     .drain(..)
                     .map(|event| crate::fileprovider::FpEventRecord {
                         ts: 0,
-                        event_type: format!("{:?}", event.event_type).to_lowercase(),
+                        event_type: crate::fileprovider::journal_type::for_server_event(&event.event_type).into(),
                         from: event.from,
                         to: event.to,
                         local_echo: false,
@@ -322,6 +319,11 @@ impl Mount {
 
         self.inventory
             .finish_fileprovider_remote_generation(&drive_id, generation)?;
+        write_baseline(
+            &mut crate::fileprovider_db::StateDb::open()?,
+            &drive_id,
+            &RemoteBaseline { root_uri: baseline_root, generation },
+        )?;
         self.inventory.deliver_fileprovider_outbox(&drive_id)?;
         signal_changes(&drive_id, &drive_name);
         crate::fileprovider::append_rescan_marker(&drive_id)?;
@@ -352,6 +354,50 @@ fn write_checkpoint(drive: &str, root: &str, since: i64) -> Result<()> {
         &serde_json::to_string(&RecoveryCheckpoint { root_uri: root.into(), since })?)
 }
 
+/// Written when a Full check finishes. Without it, the inventory holds only
+/// what incremental searches returned, and absence from it is not "new".
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+struct RemoteBaseline { root_uri: String, generation: i64 }
+
+const BASELINE_NAMESPACE: &str = "fp-remote-baseline";
+
+fn read_baseline(db: &mut crate::fileprovider_db::StateDb, drive: &str) -> Result<Option<RemoteBaseline>> {
+    db.records(BASELINE_NAMESPACE)?
+        .into_iter().find(|record| record.key == drive)
+        .map(|record| serde_json::from_str(&record.payload).map_err(Into::into)).transpose()
+}
+
+fn write_baseline(db: &mut crate::fileprovider_db::StateDb, drive: &str, baseline: &RemoteBaseline) -> Result<()> {
+    db.put(BASELINE_NAMESPACE, drive, &serde_json::to_string(baseline)?)
+}
+
+/// True only when the inventory came from a completed Full check of this root
+/// and still holds that pass's rows (drive removal deletes rows, not this record).
+fn inventory_is_complete(
+    baseline: Option<&RemoteBaseline>,
+    root_uri: &str,
+    previous: &HashMap<String, FileProviderRemoteItem>,
+) -> bool {
+    baseline.is_some_and(|baseline| baseline.root_uri == root_uri
+        && previous.values().any(|item| item.seen_generation == baseline.generation))
+}
+
+fn full_check_event_type(
+    old: Option<&FileProviderRemoteItem>,
+    uri: &str,
+    item_version: &str,
+    inventory_complete: bool,
+) -> Option<FileEventType> {
+    match old {
+        None if inventory_complete => Some(FileEventType::Create),
+        // Finder may already show it; enumeration and the closing rescan cover it.
+        None => None,
+        Some(old) if canonical_uri(&old.uri) != uri => Some(FileEventType::Rename),
+        Some(old) if old.version != item_version => Some(FileEventType::Modify),
+        _ => None,
+    }
+}
+
 fn incremental_search_uri(root: &str, field: &str, since: i64) -> Result<String> {
     ensure!(matches!(field, "updated" | "created"), "Invalid change-search field");
     let mut uri = url::Url::parse(root)?;
@@ -363,14 +409,14 @@ fn incremental_search_uri(root: &str, field: &str, since: i64) -> Result<String>
 fn incremental_event(file: &FileResponse, old: Option<&FileProviderRemoteItem>) -> Option<crate::fileprovider::FpEventRecord> {
     let uri = canonical_uri(&file.path);
     let kind = match old {
-        Some(old) if canonical_uri(&old.uri) != uri => "rename",
+        Some(old) if canonical_uri(&old.uri) != uri => crate::fileprovider::journal_type::RENAME,
         Some(old) if old.version == version(file) => return None,
-        _ => "modify", // Unknown items may already exist in Finder after migration.
+        _ => crate::fileprovider::journal_type::MODIFY, // Unknown items may already exist in Finder after migration.
     };
     Some(crate::fileprovider::FpEventRecord {
         ts: 0, event_type: kind.into(),
-        from: if kind == "rename" { old.unwrap().uri.clone() } else { uri.clone() },
-        to: if kind == "rename" { uri } else { String::new() }, local_echo: false, file_id: file.id.clone(),
+        from: if kind == crate::fileprovider::journal_type::RENAME { old.unwrap().uri.clone() } else { uri.clone() },
+        to: if kind == crate::fileprovider::journal_type::RENAME { uri } else { String::new() }, local_echo: false, file_id: file.id.clone(),
     })
 }
 
@@ -404,6 +450,75 @@ pub(crate) fn collapse_missing_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item(id: &str, uri: &str, version: &str, generation: i64) -> FileProviderRemoteItem {
+        FileProviderRemoteItem {
+            drive_id: "d".into(),
+            remote_id: id.into(),
+            uri: uri.into(),
+            parent_uri: "cloudreve://my".into(),
+            is_folder: false,
+            version: version.into(),
+            seen_generation: generation,
+        }
+    }
+
+    fn inventory(items: Vec<FileProviderRemoteItem>) -> HashMap<String, FileProviderRemoteItem> {
+        items.into_iter().map(|i| (i.remote_id.clone(), i)).collect()
+    }
+
+    #[test]
+    fn partial_inventory_does_not_create_unknown_items() {
+        let previous = inventory(vec![item("a", "cloudreve://my/a", "v", 500)]);
+        assert!(!inventory_is_complete(None, "cloudreve://my", &previous));
+        assert!(full_check_event_type(None, "cloudreve://my/b", "v", false).is_none());
+    }
+
+    #[test]
+    fn completed_baseline_creates_new_items() {
+        let baseline = RemoteBaseline { root_uri: "cloudreve://my".into(), generation: 100 };
+        let previous = inventory(vec![item("a", "cloudreve://my/a", "v", 100)]);
+        assert!(inventory_is_complete(Some(&baseline), "cloudreve://my", &previous));
+        assert!(matches!(
+            full_check_event_type(None, "cloudreve://my/b", "v", true),
+            Some(FileEventType::Create)
+        ));
+    }
+
+    #[test]
+    fn stale_baseline_is_not_complete() {
+        let baseline = RemoteBaseline { root_uri: "cloudreve://my".into(), generation: 100 };
+        let matching = inventory(vec![item("a", "cloudreve://my/a", "v", 100)]);
+        let other_gen = inventory(vec![item("a", "cloudreve://my/a", "v", 200)]);
+        assert!(!inventory_is_complete(Some(&baseline), "cloudreve://my", &HashMap::new()));
+        assert!(!inventory_is_complete(Some(&baseline), "cloudreve://my", &other_gen));
+        assert!(!inventory_is_complete(Some(&baseline), "cloudreve://other", &matching));
+    }
+
+    #[test]
+    fn known_items_keep_precise_deltas_without_a_baseline() {
+        let old = item("a", "cloudreve://my/a", "v1", 500);
+        assert!(matches!(
+            full_check_event_type(Some(&old), "cloudreve://my/moved", "v1", false),
+            Some(FileEventType::Rename)
+        ));
+        assert!(matches!(
+            full_check_event_type(Some(&old), "cloudreve://my/a", "v2", false),
+            Some(FileEventType::Modify)
+        ));
+        assert!(full_check_event_type(Some(&old), "cloudreve://my/a", "v1", false).is_none());
+    }
+
+    #[test]
+    fn baseline_round_trips_through_state_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = crate::fileprovider_db::StateDb::at(dir.path()).unwrap();
+        assert_eq!(read_baseline(&mut db, "d").unwrap(), None);
+        let baseline = RemoteBaseline { root_uri: "cloudreve://my".into(), generation: 7 };
+        write_baseline(&mut db, "d", &baseline).unwrap();
+        assert_eq!(read_baseline(&mut db, "d").unwrap(), Some(baseline));
+        assert_eq!(read_baseline(&mut db, "other").unwrap(), None);
+    }
 
     #[test]
     fn change_search_preserves_scope_and_escaped_names() {

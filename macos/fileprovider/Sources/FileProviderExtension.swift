@@ -25,7 +25,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             self.store = RemoteStore(drive: drive, domain: domain)
             self.pendingMonitor = FileProviderPendingMonitor(drive: drive, domain: domain)
             logger.notice(
-                "FileProviderExtension started for domain \(domain.displayName, privacy: .public), drive \(drive.name, privacy: .public) @ \(drive.instance_url, privacy: .public)"
+                "FileProviderExtension started for domain \(domain.displayName, privacy: .private(mask: .hash)), drive \(drive.name, privacy: .private(mask: .hash)) @ \(drive.instance_url, privacy: .private(mask: .hash))"
             )
             // Resume downloads for persisted pins.
             if let store = self.store {
@@ -47,6 +47,16 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
         super.init()
         pendingMonitor?.refresh()
+    }
+
+    /// Test seam: wraps an existing store without reading drives.json or
+    /// starting recovery work. The system always uses `init(domain:)`.
+    init(domain: NSFileProviderDomain, store: RemoteStore?,
+         pendingMonitor: FileProviderPendingMonitor? = nil) {
+        self.domain = domain
+        self.store = store
+        self.pendingMonitor = pendingMonitor
+        super.init()
     }
 
     func invalidate() {
@@ -86,15 +96,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         if let token = (item as? FileProviderItem)?.remoteVersion, !token.isEmpty {
             return token
         }
-        guard var value = String(data: baseVersion.contentVersion, encoding: .utf8) else {
-            return nil
-        }
-        if value.hasSuffix("#thumbnail-v1") {
-            value.removeLast("#thumbnail-v1".count)
-        }
-        guard value.hasPrefix("entity:") else { return nil }
-        let token = String(value.dropFirst("entity:".count))
-        return token.isEmpty ? nil : token
+        return DeletePreflight.entityToken(baseVersion.contentVersion)
     }
 
     private func uploadConflictError(_ record: UploadConflictRecord) -> Error {
@@ -260,7 +262,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 completionHandler(item, nil)
             } catch {
                 logger.error(
-                    "item(for: \(identifier.rawValue, privacy: .public)) failed: \(error.localizedDescription, privacy: .public)"
+                    "item(for: \(identifier.rawValue, privacy: .private(mask: .hash))) failed: \(error.localizedDescription, privacy: .public)"
                 )
                 completionHandler(nil, FileProviderEnumerator.mapError(error))
             }
@@ -310,7 +312,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                                 }
                             } catch {
                                 self.logger.notice(
-                                    "thumbnail unavailable for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                                    "thumbnail unavailable for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                                 )
                                 perThumbnailCompletionHandler(
                                     identifier, nil, FileProviderEnumerator.mapError(error))
@@ -358,7 +360,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     isExplicitRetry: isExplicitRetry)
                 {
                     logger.notice(
-                        "cancelled blocked system download for \(itemIdentifier.rawValue, privacy: .public)"
+                        "cancelled blocked system download for \(itemIdentifier.rawValue, privacy: .private(mask: .hash))"
                     )
                     completionHandler(nil, nil, CocoaError(.userCancelled))
                     return
@@ -394,13 +396,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     try? FileManager.default.removeItem(at: tmp)
                     activity?.fail(CocoaError(.userCancelled))
                     logger.notice(
-                        "discarded blocked system download for \(itemIdentifier.rawValue, privacy: .public)"
+                        "discarded blocked system download for \(itemIdentifier.rawValue, privacy: .private(mask: .hash))"
                     )
                     completionHandler(nil, nil, CocoaError(.userCancelled))
                     return
                 }
                 logger.notice(
-                    "served contents of \(item.filename, privacy: .public) (\(size) bytes)")
+                    "served contents of \(item.filename, privacy: .private(mask: .hash)) (\(size) bytes)")
                 activity?.complete()
                 if needsConflictRefresh {
                     UploadConflictStore.finishContentRefresh(
@@ -415,7 +417,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             } catch {
                 activity?.fail(error)
                 logger.error(
-                    "fetchContents failed for \(itemIdentifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    "fetchContents failed for \(itemIdentifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                 )
                 completionHandler(nil, nil, FileProviderEnumerator.mapError(error))
             }
@@ -519,7 +521,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                                 throw CloudreveError.badResponse("File changed during reimport; retrying")
                             }
                         }
-                        logger.notice("reconnected existing item \(uri, privacy: .public)")
+                        logger.notice("reconnected existing item \(uri, privacy: .private(mask: .hash))")
                         completionHandler(
                             store.makeItem(
                                 existing, preservingIdentifier: itemTemplate.itemIdentifier),
@@ -533,7 +535,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                             }
                             store.evictCachedItems(withIdentifiers: [itemTemplate.itemIdentifier])
                             logger.notice(
-                                "discarded stale mirrored create for remotely absent \(uri, privacy: .public)"
+                                "discarded stale mirrored create for remotely absent \(uri, privacy: .private(mask: .hash))"
                             )
                             completionHandler(nil, [], false, nil)
                             return
@@ -568,13 +570,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                         itemTemplate.itemIdentifier, remoteIdentifier,
                     ])
                     logger.notice(
-                        "discarded local create superseded by remote delete for \(uri, privacy: .public)"
+                        "discarded local create superseded by remote delete for \(uri, privacy: .private(mask: .hash))"
                     )
                     completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
                     return
                 }
 
-                logger.notice("created \(uri, privacy: .public)")
+                logger.notice("created \(uri, privacy: .private(mask: .hash))")
                 completionHandler(store.makeItem(file), [], false, nil)
 
                 // Recheck new uploads because immediate deletes may have no events.
@@ -590,13 +592,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                             let identifier = store.identifier(forURI: uri)
                             store.queueStabilizationDelete(identifier)
                             logger.notice(
-                                "queued stabilization delete for \(uri, privacy: .public)"
+                                "queued stabilization delete for \(uri, privacy: .private(mask: .hash))"
                             )
                             await store.signalWorkingSet()
                             return
                         } catch {
                             logger.error(
-                                "stabilization check failed for \(uri, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                                "stabilization check failed for \(uri, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                             )
                         }
                     }
@@ -605,7 +607,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 recordLockConflict(
                     error, identifier: itemTemplate.parentItemIdentifier, store: store)
                 logger.error(
-                    "createItem \(itemTemplate.filename, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                    "createItem \(itemTemplate.filename, privacy: .private(mask: .hash)) failed: \(error.localizedDescription, privacy: .public)"
                 )
                 completionHandler(nil, [], false, FileProviderEnumerator.mapError(error))
             }
@@ -662,6 +664,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 let previousVersion = existingConflict?.previousVersion
                     ?? versionToken(for: item, baseVersion: version)
 
+                var appliedAny = false
                 // Apply supported content, name, and parent changes.
                 if changedFields.contains(.contents), let newContents {
                     if let existingConflict, conflictAction == nil {
@@ -739,19 +742,55 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                             driveID: store.drive.id, uri: originalURI))
                     store.clearLockState(for: uri)
                     pending.remove(.contents)
+                    appliedAny = true
                 }
 
-                if changedFields.contains(.filename) {
-                    _ = try await store.client.renameFile(uri: uri, to: item.filename)
-                    uri = Self.parentURI(of: uri) + "/" + item.filename
-                    pending.remove(.filename)
-                }
+                do {
+                    if changedFields.contains(.filename) {
+                        let target = Self.parentURI(of: uri) + "/" + item.filename
+                        do {
+                            _ = try await store.client.renameFile(uri: uri, to: item.filename)
+                        } catch CloudreveError.noSuchItem {
+                            let existing = try? await store.client.fileInfo(uri: target)
+                            guard MutationReplay.alreadyApplied(
+                                identifier: item.itemIdentifier.rawValue,
+                                destination: existing) else { throw CloudreveError.noSuchItem }
+                            logger.notice("rename of \(item.itemIdentifier.rawValue, privacy: .private(mask: .hash)) was already applied")
+                        }
+                        uri = target
+                        pending.remove(.filename)
+                        appliedAny = true
+                    }
 
-                if changedFields.contains(.parentItemIdentifier) {
-                    let dst = store.uri(for: item.parentItemIdentifier)
-                    try await store.client.moveFile(uri: uri, toDirectory: dst)
-                    uri = dst + "/" + item.filename
-                    pending.remove(.parentItemIdentifier)
+                    if changedFields.contains(.parentItemIdentifier) {
+                        let dst = store.uri(for: item.parentItemIdentifier)
+                        let target = dst + "/" + item.filename
+                        do {
+                            try await store.client.moveFile(uri: uri, toDirectory: dst)
+                        } catch CloudreveError.noSuchItem {
+                            let existing = try? await store.client.fileInfo(uri: target)
+                            guard MutationReplay.alreadyApplied(
+                                identifier: item.itemIdentifier.rawValue,
+                                destination: existing) else { throw CloudreveError.noSuchItem }
+                            logger.notice("move of \(item.itemIdentifier.rawValue, privacy: .private(mask: .hash)) was already applied")
+                        }
+                        uri = target
+                        pending.remove(.parentItemIdentifier)
+                        appliedAny = true
+                    }
+                } catch {
+                    if appliedAny, ReplayFailure.classify(error) != .cancelled,
+                        let fresh = try? await store.client.fileInfoWithShareState(uri: uri)
+                    {
+                        logger.notice(
+                            "modify of \(uri, privacy: .private(mask: .hash)) applied partially; deferring \(pending.rawValue)"
+                        )
+                        completionHandler(
+                            store.makeItem(fresh, preservingIdentifier: item.itemIdentifier),
+                            pending, false, nil)
+                        return
+                    }
+                    throw error
                 }
 
                 if try FileProviderDeleteIntentStore.containsURI(driveID: store.drive.id, uri: originalURI)
@@ -761,7 +800,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     try? await store.client.deleteFile(uri: uri)
                     store.evictCachedItems(withIdentifiers: [item.itemIdentifier])
                     logger.notice(
-                        "discarded local modification superseded by remote delete for \(originalURI, privacy: .public)"
+                        "discarded local modification superseded by remote delete for \(originalURI, privacy: .private(mask: .hash))"
                     )
                     completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
                     return
@@ -775,10 +814,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     && freshItem.itemVersion.contentVersion != version.contentVersion
                 if shouldFetchContent {
                     logger.notice(
-                        "remote content changed during metadata update for \(uri, privacy: .public); requesting fresh content"
+                        "remote content changed during metadata update for \(uri, privacy: .private(mask: .hash)); requesting fresh content"
                     )
                 }
-                logger.notice("modified \(uri, privacy: .public) (fields: \(changedFields.rawValue))")
+                logger.notice("modified \(uri, privacy: .private(mask: .hash)) (fields: \(changedFields.rawValue))")
                 completionHandler(
                     freshItem, pending, shouldFetchContent, nil)
             } catch {
@@ -796,14 +835,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                         forcePresentation: attemptedConflictAction == .retry)
                 {
                     logger.notice(
-                        "upload paused for \(item.filename, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                        "upload paused for \(item.filename, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                     )
                     completionHandler(nil, [], false, conflictError)
                     return
                 }
                 recordLockConflict(error, identifier: item.itemIdentifier, store: store)
                 logger.error(
-                    "modifyItem \(item.filename, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                    "modifyItem \(item.filename, privacy: .private(mask: .hash)) failed: \(error.localizedDescription, privacy: .public)"
                 )
                 completionHandler(nil, [], false, FileProviderEnumerator.mapError(error))
             }
@@ -830,27 +869,44 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
         Task {
             do {
+                let uri = store.uri(for: identifier)
+                let remote = try await store.client.fileInfo(uri: uri)
+                var childNames: [String]? = nil
+                if remote.isFolder && !options.contains(.recursive) {
+                    childNames = try await store.client.listDirectory(uri: uri, page: nil).files.map(\.name)
+                }
+                switch DeletePreflight.decide(remote: remote, recursive: options.contains(.recursive),
+                                              remoteChildNames: childNames,
+                                              baseContentVersion: version.contentVersion) {
+                case .proceed: break
+                case .directoryNotEmpty:
+                    logger.notice("refused non-recursive delete of non-empty \(identifier.rawValue, privacy: .private(mask: .hash))")
+                    completionHandler(NSFileProviderError(.directoryNotEmpty)); return
+                case .deletionRejected:
+                    logger.notice("refused delete of remotely changed \(identifier.rawValue, privacy: .private(mask: .hash))")
+                    completionHandler(NSFileProviderError(.deletionRejected)); return
+                }
                 try FileProviderDeleteIntentStore.begin(driveID: store.drive.id,
-                    identifier: identifier.rawValue, uri: store.uri(for: identifier))
-                store.recordRemoteDelete(for: store.uri(for: identifier))
-                try await store.client.cancelOwnedUploads(under: store.uri(for: identifier))
-                try await store.client.deleteFile(uri: store.uri(for: identifier))
+                    identifier: identifier.rawValue, uri: uri)
+                store.recordRemoteDelete(for: uri)
+                try await store.client.cancelOwnedUploads(under: uri)
+                try await store.client.deleteFile(uri: uri)
                 try FileProviderDeleteIntentStore.finish(driveID: store.drive.id, identifier: identifier.rawValue)
                 store.evictCachedItems(withIdentifiers: [identifier])
-                logger.notice("deleted \(identifier.rawValue, privacy: .public)")
+                logger.notice("deleted \(identifier.rawValue, privacy: .private(mask: .hash))")
                 completionHandler(nil)
             } catch CloudreveError.noSuchItem {
                 try? FileProviderDeleteIntentStore.finish(driveID: store.drive.id, identifier: identifier.rawValue)
                 // Treat an already-removed item as deleted.
                 store.evictCachedItems(withIdentifiers: [identifier])
                 logger.notice(
-                    "delete acknowledged for already absent \(identifier.rawValue, privacy: .public)"
+                    "delete acknowledged for already absent \(identifier.rawValue, privacy: .private(mask: .hash))"
                 )
                 completionHandler(nil)
             } catch {
                 recordLockConflict(error, identifier: identifier, store: store)
                 logger.error(
-                    "deleteItem \(identifier.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                    "deleteItem \(identifier.rawValue, privacy: .private(mask: .hash)) failed: \(error.localizedDescription, privacy: .public)"
                 )
                 completionHandler(FileProviderEnumerator.mapError(error))
             }
@@ -949,7 +1005,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     completionHandler(nil)
                 } catch {
                     logger.error(
-                        "OpenInBrowser failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                        "OpenInBrowser failed for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                     )
                     completionHandler(error)
                 }
@@ -1101,7 +1157,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                             driveID: store.drive.id, uri: store.uri(for: identifier))
                     }
                     logger.error(
-                        "\(actionIdentifier.rawValue, privacy: .public) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                        "\(actionIdentifier.rawValue, privacy: .public) failed for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                     )
                     firstError = firstError ?? ((Task.isCancelled || progress.isCancelled)
                         ? CocoaError(.userCancelled) : error)
@@ -1160,7 +1216,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 publishedProgress = true
             } catch {
                 logger.notice(
-                    "could not publish folder progress for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    "could not publish folder progress for \(identifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                 )
             }
         }
@@ -1289,7 +1345,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             if !failedEvictions.isEmpty {
                 let identifiers = failedEvictions.prefix(3).map(\.rawValue).joined(separator: ", ")
                 logger.notice(
-                    "deferring eviction while downloads settle for \(identifiers, privacy: .public)"
+                    "deferring eviction while downloads settle for \(identifiers, privacy: .private(mask: .hash))"
                 )
                 releaseSuppressionWhenDone = false
                 store.retryEvictionsWhenUnpinned(
@@ -1308,7 +1364,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             }
         }
         logger.notice(
-            "\(pin ? "pinned" : "unpinned", privacy: .public) \(identifier.rawValue, privacy: .public)"
+            "\(pin ? "pinned" : "unpinned", privacy: .public) \(identifier.rawValue, privacy: .private(mask: .hash))"
         )
     }
 
@@ -1331,7 +1387,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             if isActive {
                 if !sawActivity {
                     logger.notice(
-                        "tracking folder downloads below \(identifier.rawValue, privacy: .public)"
+                        "tracking folder downloads below \(identifier.rawValue, privacy: .private(mask: .hash))"
                     )
                 }
                 sawActivity = true
@@ -1358,7 +1414,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
 
         logger.notice(
-            "folder downloads settled below \(identifier.rawValue, privacy: .public)"
+            "folder downloads settled below \(identifier.rawValue, privacy: .private(mask: .hash))"
         )
     }
 

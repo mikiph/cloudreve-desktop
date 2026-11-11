@@ -99,6 +99,45 @@ import FileProvider
         precondition(afterTree[a.itemIdentifier.rawValue] == nil, "child evicted immediately")
         precondition(afterTree[b.itemIdentifier.rawValue] == nil, "grandchild evicted immediately")
 
+        // Tombstones age out after the retention window; the sidecar survives restarts.
+        var oldItems: [NSFileProviderItemIdentifier] = []
+        for i in 1...3 {
+            oldItems.append(store.makeItem(file("OLD\(i)", path: "cloudreve://my/age/old\(i).txt")).itemIdentifier)
+        }
+        let newItem = store.makeItem(file("NEW1", path: "cloudreve://my/age/new1.txt")).itemIdentifier
+        for id in oldItems { store.evictCachedItems(withIdentifiers: [id]) }
+        precondition(oldItems.allSatisfy { tombstones()[$0.rawValue] != nil }, "old tombstones recorded")
+        precondition(store.isKnownIdentity(oldItems[0], forURI: "cloudreve://my/age/old1.txt"))
+        let aged = Date().addingTimeInterval(31 * 24 * 3600)
+        store.tombstoneClock = { aged }
+        store.evictCachedItems(withIdentifiers: [newItem])
+        let afterAge = tombstones()
+        precondition(oldItems.allSatisfy { afterAge[$0.rawValue] == nil }, "tombstones past retention are pruned")
+        precondition(afterAge[newItem.rawValue] == "cloudreve://my/age/new1.txt", "fresh tombstone kept")
+        precondition(!store.isKnownIdentity(oldItems[0], forURI: "cloudreve://my/age/old1.txt"))
+        precondition(store.isKnownIdentity(newItem, forURI: "cloudreve://my/age/new1.txt"))
+        let restarted = RemoteStore(drive: drive, domain: domain, stateDirectory: root)
+        precondition(restarted.isKnownIdentity(newItem, forURI: "cloudreve://my/age/new1.txt"), "sidecar loaded on restart")
+        precondition(!restarted.isKnownIdentity(oldItems[0], forURI: "cloudreve://my/age/old1.txt"))
+
+        // Count cap keeps only the newest tombstones.
+        let savedLimit = RemoteStore.tombstoneLimit
+        RemoteStore.tombstoneLimit = 5
+        var capItems: [NSFileProviderItemIdentifier] = []
+        for i in 0..<8 {
+            capItems.append(store.makeItem(file("CAP\(i)", path: "cloudreve://my/cap/\(i).txt")).itemIdentifier)
+        }
+        for (i, id) in capItems.enumerated() {
+            let t = aged.addingTimeInterval(Double(i + 1) * 1000)
+            store.tombstoneClock = { t }
+            store.evictCachedItems(withIdentifiers: [id])
+        }
+        let capped = tombstones()
+        precondition(capped.count == 5, "cap keeps exactly 5, got \(capped.count)")
+        precondition(capItems[3...].allSatisfy { capped[$0.rawValue] != nil }, "the 5 newest remain")
+        precondition(capItems[..<3].allSatisfy { capped[$0.rawValue] == nil }, "older tombstones dropped")
+        RemoteStore.tombstoneLimit = savedLimit
+
         // The journal carries the ID; older records without it still decode.
         let withID = try JSONDecoder().decode(RemoteStore.FpEvent.self,
             from: Data(#"{"ts":1,"type":"delete","from":"/a","to":"","file_id":"A"}"#.utf8))

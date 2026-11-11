@@ -139,8 +139,10 @@ Full check performs the previous metadata-only traversal in pages of 200. It
 preserves downloads, pins and domain identity. A complete pass alone infers
 missing inventory items as deletions, collapsing descendants of missing folders.
 It refreshes Finder's working set and updates the incremental checkpoint after
-success. An empty inventory establishes a baseline without creating activity
-for every existing file. Received-share redirects are not recursively traversed.
+success. Until a Full check has completed for the current root, the inventory holds
+only what incremental searches returned. Such a pass reports renames and
+modifications of known items but does not create activity for every unknown
+file, and its completion records the baseline used by later Full checks. Received-share redirects are not recursively traversed.
 Full check is never scheduled automatically by startup, reconnect or menu refresh.
 
 API references: [List files](https://cloudrevev4.apifox.cn/list-files-300233178e0),
@@ -529,8 +531,9 @@ for both cursor and screen frames. It is then ordered on the clicked display
 with all-Spaces/full-screen auxiliary behavior. No primary-display scaling is
 applied to a secondary monitor.
 
-The macOS extension chunks local/relay uploads and attempts to cancel the session
-on an error. Build 193 records its own session IDs and URIs in SQLite before
+The macOS extension chunks local, relay and remote (slave node) uploads; other
+storage policies are refused. It sends the account token only to the instance
+origin, and it attempts to cancel the session on an error. Build 193 records its own session IDs and URIs in SQLite before
 uploading chunks. A local deletion cancels matching owned sessions in that
 subtree only after verifying the server still reports the same session ID.
 Failed cancellations remain recorded for a later deletion retry. Editor locks

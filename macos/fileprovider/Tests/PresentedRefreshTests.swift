@@ -100,8 +100,21 @@ enum PresentedRefreshTests {
         precondition(observer.completed && observer.failure == nil, "A blocked folder listing must not block the working-set journal")
         precondition(observer.deleted.contains("cloudreve://my/deleted.txt"))
         try preconditionValue(state(database).pending, "The marker must persist its work before being acknowledged")
-        let applied = try JSONSerialization.jsonObject(with: database.get("fp-applied", "test")!) as! [String: Int64]
-        precondition(applied["sequence"] == 28)
+        // The enumerator acknowledges (records fp-applied) right after it
+        // finishes delivering, so the record can land just after the observer
+        // completes. Wait for it instead of reading once.
+        var appliedSequence: Int64?
+        for _ in 0..<200 {
+            if let payload = try database.get("fp-applied", "test"),
+                let applied = try JSONSerialization.jsonObject(with: payload) as? [String: Int64],
+                applied["sequence"] == 28
+            {
+                appliedSequence = 28
+                break
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        precondition(appliedSequence == 28, "The working-set anchor must be acknowledged after delivery")
         await blocked.release()
         // Let the now-finished worker retire before testing transactional pages.
         for _ in 0..<200 {

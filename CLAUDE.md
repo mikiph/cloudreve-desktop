@@ -50,7 +50,7 @@ cargo tauri build              # Production build
 
 ### macOS File Provider (`macos/`)
 
-- `fileprovider/Sources/`: Swift `NSFileProviderReplicatedExtension` backed by the Cloudreve API — enumerates directories, downloads file contents on demand, and supports mutations (create/upload, rename, move, delete-to-trash; local/relay storage policies only). Reads `~/.cloudreve/drives.json` via a sandbox temporary-exception (local dev only; use an app group for distribution).
+- `fileprovider/Sources/`: Swift `NSFileProviderReplicatedExtension` backed by the Cloudreve API — enumerates directories, downloads file contents on demand, and supports mutations (create/upload, rename, move, delete-to-trash; uploads to local and relay policies through the instance, and to remote (slave node) policies with the upload-session credential; other storage policies are refused with an "upload from the website" error). Reads `~/.cloudreve/drives.json` via a sandbox temporary-exception (local dev only; use an app group for distribution).
 - On macOS, drives are **File Provider only**: `Mount::start()` is a no-op (no sync folder, no FS watcher, no initial sync), `MountCommand::Sync` is ignored, and `get_drives_info` reports the domain's user-visible URL (`~/Library/CloudStorage/...`) instead of `sync_path`.
 - Remote-change feed: the app's SSE listener (`remote_events.rs`) commits events to the `fp_events` journal in `~/.cloudreve/fileprovider.db` (SQLite, shared with the extension) and calls `signalEnumerator(workingSet)` — the extension replays the journal in `enumerateChanges`. The extension itself cannot hold a long-lived SSE connection (XPC services are suspended when idle). Only the working-set container may be signaled for replicated extensions (per NSFileProviderManager.h docs); anchors are `evt-<sequence>` where the sequence is allocated as `max(now_ms, latest+1)`; unknown or pruned anchors yield `syncAnchorExpired` (full rescan).
 - Client IDs: the app sends `X-Cr-Client-Id` derived from the drive UUID (`api_client_id` in mounts.rs) — sharing one ID across processes breaks the server-side event channel.
@@ -85,7 +85,7 @@ Endpoints used by the extension (all under `{instance_url}/api/v4`, auth via `Au
 - `GET /file?uri=<cloudreve://my/...>&page_size=&next_page_token=|page=` — list directory (token- or page-based pagination)
 - `GET /file/info?uri=` — file metadata (`type` 0=file/1=folder, `path` is a full `cloudreve://my/...` URI)
 - `POST /file/url` `{uris, download:true}` → presigned download URLs
-- `PUT /file/upload` `{uri, size, policy_id:"", entity_type:"version"?, previous?}` → upload session; chunks via `POST /file/upload/{session_id}/{index}` (local/relay policies auto-complete). A 40073 response means another application holds a lock; never force-unlock it automatically. Cancel only upload sessions created by this client with `DELETE /file/upload` `{id, uri}`.
+- `PUT /file/upload` `{uri, size, policy_id:"", entity_type:"version"?, previous?}` → upload session; chunks via `POST /file/upload/{session_id}/{index}` (local/relay/remote policies complete server-side; the account Bearer token is sent only to the instance origin, and a slave-node `upload_urls` target gets the session `credential` instead). A 40073 response means another application holds a lock; never force-unlock it automatically. Cancel only upload sessions created by this client with `DELETE /file/upload` `{id, uri}`.
 - `POST /file/create` `{uri, type:"file"|"folder"}`, `POST /file/rename` `{uri, new_name}`, `POST /file/move` `{uris, dst}`, `DELETE /file` `{uris}` — mutations; DELETE without `unlink` is a soft delete (server trash; trash listing URI is `cloudreve://trash`)
 - `POST /file/restore` `{uris}` — restore from trash. **Quirk:** trash items live at `cloudreve://trash/<uuid>`, and restore emits `create` events with that bogus UUID path — always verify create/modify event paths with `/file/info`; on 404, force a full rescan instead of replaying the event.
 - `POST /session/token/refresh` `{refresh_token}` → new token pair
@@ -110,6 +110,7 @@ macOS development notes:
 - New File Provider domains start **user-disabled**; enable once in System Settings → General → Login Items & Extensions → File Providers.
 - `pluginkit -a <appex>` is needed to register hand-built extensions; `fileproviderctl dump <domain>` shows sync engine state.
 - `log` is a zsh builtin — use `/usr/bin/log stream --predicate 'subsystem == "cloudreve.desktop.fileprovider"'` for extension logs.
+- Extension logs hash URIs, file names and item identifiers (`privacy: .private(mask: .hash)`); the same value always yields the same hash, so follow an item by its hash. Error descriptions, event types and counts stay public. Do not log file names or URIs with `.public`.
 
 #### macOS upgrade-safe build procedure
 

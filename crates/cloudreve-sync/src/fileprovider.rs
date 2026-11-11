@@ -52,7 +52,7 @@ async fn await_completion<T>(
     what: &str,
 ) -> Result<T> {
     match tokio::time::timeout(limit, rx).await {
-        Err(_) => Err(anyhow!("Finder did not respond to {what} within {} seconds. Try again; nothing was changed by Cloudreve.", limit.as_secs())),
+        Err(_) => Err(anyhow!("Finder did not respond to {what} within {} seconds. macOS may still finish it in the background; check Finder before trying again.", limit.as_secs())),
         Ok(Err(_)) => Err(anyhow!("{what} callback dropped")),
         Ok(Ok(result)) => result,
     }
@@ -140,6 +140,18 @@ fn make_domain(id: &str, display_name: &str) -> Retained<NSFileProviderDomain> {
     }
 }
 
+/// Runs `f` with the domain's NSFileProviderManager inside an autorelease
+/// pool. Tokio worker threads have no pool, so autoreleased objects from
+/// these calls would otherwise live until the thread exits (never).
+/// Returns None when the system has no manager for the domain.
+fn with_manager<R>(domain: &NSFileProviderDomain, f: impl FnOnce(&AnyObject) -> R) -> Option<R> {
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let manager: Option<Retained<AnyObject>> =
+            msg_send![class!(NSFileProviderManager), managerForDomain: domain];
+        manager.map(|manager| f(&manager))
+    })
+}
+
 /// The raw value of `NSFileProviderRootContainerItemIdentifier`
 /// (used when signaling changes at the drive root).
 pub const ROOT_CONTAINER: &str = "NSFileProviderRootContainerItemIdentifier";
@@ -167,18 +179,13 @@ pub async fn user_visible_item_url(
                 let _ = tx.send(path);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return None;
-            }
+        with_manager(&domain, |manager| unsafe {
             let _: () = msg_send![
-                &*manager,
+                manager,
                 getUserVisibleURLForItemIdentifier: &*identifier,
                 completionHandler: &*block
             ];
-        }
+        })?;
     }
     tokio::time::timeout(Duration::from_secs(10), rx).await.ok()?.ok().flatten()
 }
@@ -352,6 +359,38 @@ fn mark_download_retry(domain_id: &str, item_identifier: &str) -> Result<()> {
 
 // MARK: - Shared event log
 
+/// `type` values written to the fp_events journal. The Swift extension reads
+/// the same strings (`JournalEventType.swift`); both are checked against
+/// `macos/fileprovider/Tests/Fixtures/journal-event-types.txt`.
+pub mod journal_type {
+    pub const CREATE: &str = "create";
+    pub const MODIFY: &str = "modify";
+    pub const RENAME: &str = "rename";
+    pub const DELETE: &str = "delete";
+    pub const RESCAN: &str = "rescan";
+    pub const REFRESH_PRESENTED: &str = "refresh_presented";
+    pub const METADATA: &str = "metadata";
+    pub const METADATA_RESCAN: &str = "metadata_rescan";
+    pub const METADATA_NAME: &str = "metadata_name";
+    /// Every type the host writes.
+    pub const HOST_WRITTEN: [&str; 9] = [
+        CREATE, MODIFY, RENAME, DELETE, RESCAN, REFRESH_PRESENTED,
+        METADATA, METADATA_RESCAN, METADATA_NAME,
+    ];
+
+    /// Journal type for a server SSE event. Exhaustive on purpose: a new
+    /// server event variant must be mapped here before it can compile.
+    pub fn for_server_event(kind: &cloudreve_api::models::explorer::FileEventType) -> &'static str {
+        use cloudreve_api::models::explorer::FileEventType;
+        match kind {
+            FileEventType::Create => CREATE,
+            FileEventType::Modify => MODIFY,
+            FileEventType::Rename => RENAME,
+            FileEventType::Delete => DELETE,
+        }
+    }
+}
+
 /// One recorded remote event, stored transactionally in fileprovider.db.
 /// The File Provider extension replays the journal in enumerateChanges (it cannot run a
 /// long-lived SSE listener itself: XPC services get suspended when idle).
@@ -423,7 +462,7 @@ fn build_event_records(
     });
     marker.into_iter().chain(events.iter().map(|event| FpEventRecord {
         ts: 0,
-        event_type: format!("{:?}", event.event_type).to_lowercase(),
+        event_type: journal_type::for_server_event(&event.event_type).into(),
         from: event.from.clone(),
         to: event.to.clone(),
         local_echo: local_echo_paths.contains(&event.from) || (!event.to.is_empty() && local_echo_paths.contains(&event.to)),
@@ -434,23 +473,23 @@ fn build_event_records(
 /// A bounded refresh of root and recently presented folders. Does not expire
 /// the working-set anchor or recursively enumerate Keep Downloaded trees.
 pub fn append_presented_refresh(drive_id: &str) -> Result<()> {
-    append_state_events(drive_id, "refresh_presented", &[String::new()])
+    append_state_events(drive_id, journal_type::REFRESH_PRESENTED, &[String::new()])
 }
 
 pub fn append_rescan_marker(drive_id: &str) -> Result<()> {
-    append_state_events(drive_id, "rescan", &[String::new()])
+    append_state_events(drive_id, journal_type::RESCAN, &[String::new()])
 }
 
 pub fn append_metadata_events(drive_id: &str, source_uris: &[String]) -> Result<()> {
     if source_uris.is_empty() {
-        append_state_events(drive_id, "metadata_rescan", &[String::new()])
+        append_state_events(drive_id, journal_type::METADATA_RESCAN, &[String::new()])
     } else {
-        append_state_events(drive_id, "metadata", source_uris)
+        append_state_events(drive_id, journal_type::METADATA, source_uris)
     }
 }
 
 pub fn append_metadata_name_events(drive_id: &str, names: &[String]) -> Result<()> {
-    append_state_events(drive_id, "metadata_name", names)
+    append_state_events(drive_id, journal_type::METADATA_NAME, names)
 }
 
 fn append_state_events(drive_id: &str, kind: &str, paths: &[String]) -> Result<()> {
@@ -466,13 +505,7 @@ fn append_state_events(drive_id: &str, kind: &str, paths: &[String]) -> Result<(
 /// changes (launching it if needed).
 pub fn signal_containers(domain_id: &str, display_name: &str, containers: &[String]) {
     let domain = make_domain(domain_id, display_name);
-    unsafe {
-        let manager: *mut AnyObject =
-            msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-        if manager.is_null() {
-            tracing::warn!(target: "fileprovider", "no NSFileProviderManager for domain {domain_id} (not registered?)");
-            return;
-        }
+    let found = with_manager(&domain, |manager| unsafe {
         for container in containers {
             let identifier = NSString::from_str(container);
             let container_log = container.clone();
@@ -485,11 +518,14 @@ pub fn signal_containers(domain_id: &str, display_name: &str, containers: &[Stri
                 }
             });
             let _: () = msg_send![
-                &*manager,
+                manager,
                 signalEnumeratorForContainerItemIdentifier: &*identifier,
                 completionHandler: &*block
             ];
         }
+    });
+    if found.is_none() {
+        tracing::warn!(target: "fileprovider", "no NSFileProviderManager for domain {domain_id} (not registered?)");
     }
 }
 
@@ -516,17 +552,15 @@ async fn signal_error_resolved(
                 let _ = tx.send(result);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
-            }
+        let sent = with_manager(&domain, |manager| unsafe {
             let _: () = msg_send![
-                &*manager,
+                manager,
                 signalErrorResolved: &*resolved_error,
                 completionHandler: &*block
             ];
+        });
+        if sent.is_none() {
+            return Err(anyhow!("no File Provider manager for domain {domain_id}"));
         }
     }
     await_completion(rx, FINDER_CALL_TIMEOUT, "the error resolution").await
@@ -596,19 +630,17 @@ pub async fn retry_item_upload(
                 let _ = tx.send(result);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
-            }
+        let sent = with_manager(&domain, |manager| unsafe {
             let _: () = msg_send![
-                &*manager,
+                manager,
                 requestModificationOfFields: 1usize,
                 forItemWithIdentifier: &*identifier,
                 options: 0usize,
                 completionHandler: &*block
             ];
+        });
+        if sent.is_none() {
+            return Err(anyhow!("no File Provider manager for domain {domain_id}"));
         }
     }
     await_completion(rx, FINDER_CALL_TIMEOUT, "the upload retry").await
@@ -639,19 +671,17 @@ pub async fn retry_item_download(
                 let _ = tx.send(result);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
-            }
+        let sent = with_manager(&domain, |manager| unsafe {
             let full_file = NSRange::new(isize::MAX as usize, 0);
             let _: () = msg_send![
-                &*manager,
+                manager,
                 requestDownloadForItemWithIdentifier: &*identifier,
                 requestedRange: full_file,
                 completionHandler: &*block
             ];
+        });
+        if sent.is_none() {
+            return Err(anyhow!("no File Provider manager for domain {domain_id}"));
         }
     }
     await_completion(rx, FINDER_CALL_TIMEOUT, "the download retry").await
@@ -1005,12 +1035,12 @@ async fn list_domain_states() -> Result<Vec<(String, String, bool, bool)>> {
                 }
             },
         );
-        unsafe {
+        objc2::rc::autoreleasepool(|_| unsafe {
             let _: () = msg_send![
                 class!(NSFileProviderManager),
                 getDomainsWithCompletionHandler: &*block
             ];
-        }
+        });
     }
     tokio::time::timeout(Duration::from_secs(10), rx).await
         .map_err(|_| anyhow!("Finder did not respond when listing domains"))?
@@ -1034,13 +1064,13 @@ pub async fn add_domain(domain_id: &str, display_name: &str) -> Result<()> {
                 let _ = tx.send(result);
             }
         });
-        unsafe {
+        objc2::rc::autoreleasepool(|_| unsafe {
             let _: () = msg_send![
                 class!(NSFileProviderManager),
                 addDomain: &*domain,
                 completionHandler: &*block
             ];
-        }
+        });
     }
     await_completion(rx, DOMAIN_LIFECYCLE_TIMEOUT, "adding the Finder location").await
 }
@@ -1070,7 +1100,7 @@ pub async fn remove_domain(domain_id: &str, display_name: &str) -> Result<Option
                 }
             },
         );
-        unsafe {
+        objc2::rc::autoreleasepool(|_| unsafe {
             // NSFileProviderDomainRemovalModePreserveDirtyUserData = 1
             let _: () = msg_send![
                 class!(NSFileProviderManager),
@@ -1078,7 +1108,7 @@ pub async fn remove_domain(domain_id: &str, display_name: &str) -> Result<Option
                 mode: 1isize,
                 completionHandler: &*block
             ];
-        }
+        });
     }
     await_completion(rx, DOMAIN_LIFECYCLE_TIMEOUT, "removing the Finder location").await
 }
@@ -1102,23 +1132,21 @@ pub async fn set_domain_connected(domain_id: &str, display_name: &str, connected
                 let _ = tx.send(result);
             }
         });
-        unsafe {
-            let manager: *mut AnyObject =
-                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
-            if manager.is_null() {
-                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
-            }
+        let sent = with_manager(&domain, |manager| unsafe {
             if connected {
-                let _: () = msg_send![&*manager, reconnectWithCompletionHandler: &*block];
+                let _: () = msg_send![manager, reconnectWithCompletionHandler: &*block];
             } else {
                 let reason = NSString::from_str(reason);
                 let _: () = msg_send![
-                    &*manager,
+                    manager,
                     disconnectWithReason: &*reason,
                     options: 0usize,
                     completionHandler: &*block
                 ];
             }
+        });
+        if sent.is_none() {
+            return Err(anyhow!("no File Provider manager for domain {domain_id}"));
         }
     }
     tokio::time::timeout(Duration::from_secs(10), rx).await
@@ -1398,6 +1426,8 @@ mod lifecycle_tests {
         let (_tx, rx) = oneshot::channel::<Result<()>>();
         let error = await_completion(rx, Duration::from_millis(50), "test").await.unwrap_err();
         assert!(error.to_string().contains("did not respond"));
+        assert!(!error.to_string().contains("nothing was changed"));
+        assert!(error.to_string().contains("may still finish"));
     }
 
     #[tokio::test]
@@ -1480,5 +1510,24 @@ mod upload_receipt_tests {
         let mut records = build_event_records(Some("rescan"), &[], &Default::default());
         db.append_events_consuming("d", &mut records, &[]).unwrap();
         assert_eq!(db.latest_event_sequence("d").unwrap(), records[0].ts);
+    }
+
+    #[test]
+    fn journal_types_match_the_shared_fixture() {
+        let fixture = include_str!("../../../macos/fileprovider/Tests/Fixtures/journal-event-types.txt");
+        let mut host: Vec<&str> = fixture.lines()
+            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(_, writer)| *writer == "host")
+            .map(|(kind, _)| kind)
+            .collect();
+        host.sort_unstable();
+        let mut ours = super::journal_type::HOST_WRITTEN.to_vec();
+        ours.sort_unstable();
+        assert_eq!(ours, host, "update journal-event-types.txt and JournalEventType.swift together");
+        use cloudreve_api::models::explorer::FileEventType;
+        for kind in [FileEventType::Create, FileEventType::Modify, FileEventType::Rename, FileEventType::Delete] {
+            assert!(ours.contains(&super::journal_type::for_server_event(&kind)));
+        }
     }
 }
