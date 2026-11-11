@@ -247,8 +247,8 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         for change in changes {
             let path: String?
             switch change.type {
-            case "create", "modify", "metadata": path = change.from
-            case "rename": path = change.to
+            case JournalEventType.create, JournalEventType.modify, JournalEventType.metadata: path = change.from
+            case JournalEventType.rename: path = change.to
             default: path = nil
             }
             guard let path else { continue }
@@ -268,17 +268,17 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         change: RemoteStore.FpEvent, to observer: NSFileProviderChangeObserver,
         prefetched: PrefetchedInfo = [:]
     ) async throws -> NSFileProviderItemIdentifier? {
-        if change.type == "refresh_presented" {
+        if change.type == JournalEventType.refreshPresented {
             try store.requestPresentedRefresh(sequence: change.ts)
             return nil
         }
-        if change.type == "presented_page", let page = change.presentation {
+        if change.type == JournalEventType.presentedPage, let page = change.presentation {
             let result = store.applyPresentedPage(page)
             if !result.items.isEmpty { observer.didUpdate(result.items) }
             if !result.deleted.isEmpty { observer.didDeleteItems(withIdentifiers: result.deleted) }
             return nil
         }
-        if change.type == "metadata_rescan" {
+        if change.type == JournalEventType.metadataRescan {
             let items = await store.refreshPresentedShareMetadata()
             if !items.isEmpty {
                 logger.notice("refreshing share metadata for \(items.count) presented item(s)")
@@ -286,7 +286,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             }
             return nil
         }
-        if change.type == "metadata_name" {
+        if change.type == JournalEventType.metadataName {
             let items = await store.refreshShareMetadata(named: change.from)
             if !items.isEmpty { observer.didUpdate(items) }
             return nil
@@ -296,18 +296,18 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             "applying \(change.type, privacy: .public) for \(fromURI, privacy: .public)"
         )
         switch change.type {
-        case "create", "modify", "metadata":
+        case JournalEventType.create, JournalEventType.modify, JournalEventType.metadata:
             // Refresh metadata; a disappeared item becomes a delete.
             do {
                 let file = try await fileInfo(fromURI, prefetched)
                 let parents = try await store.parentItemsForUpdate(file)
                 if !parents.isEmpty { observer.didUpdate(parents) }
-                let discoverSubtree = file.isFolder && change.type != "metadata"
-                    && (change.type == "create" || store.needsSubtreeRefresh(file))
+                let discoverSubtree = file.isFolder && change.type != JournalEventType.metadata
+                    && (change.type == JournalEventType.create || store.needsSubtreeRefresh(file))
                 let item = store.makeItem(file)
                 if discoverSubtree { try store.requestSubtreeRefresh(file) }
                 let refreshContent = containerIdentifier == .workingSet
-                    && change.type == "modify" && !file.isFolder && change.localEcho != true
+                    && change.type == JournalEventType.modify && !file.isFolder && change.localEcho != true
                 logger.notice(
                     "refreshed \(fromURI, privacy: .public), shared: \(file.shared == true, privacy: .public)"
                 )
@@ -318,7 +318,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 store.evictCachedItems(withIdentifiers: [identifier])
                 observer.didDeleteItems(withIdentifiers: [identifier])
             }
-        case "delete":
+        case JournalEventType.delete:
             let identifier = store.identifierForRemoteDelete(uri: fromURI, fileID: change.fileID)
             logger.notice(
                 "delivering remote delete for \(fromURI, privacy: .public) as \(identifier.rawValue, privacy: .public)"
@@ -326,7 +326,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             store.recordRemoteDelete(for: fromURI)
             store.evictCachedItems(withIdentifiers: [identifier])
             observer.didDeleteItems(withIdentifiers: [identifier])
-        case "rename":
+        case JournalEventType.rename:
             let identifier = store.identifier(forURI: fromURI)
             if let to = change.to {
                 let toURI = store.uri(forEventPath: to)

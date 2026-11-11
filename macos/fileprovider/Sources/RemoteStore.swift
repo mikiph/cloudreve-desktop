@@ -1615,15 +1615,15 @@ final class RemoteStore {
         }
         let events = try snapshot.events.map { try JSONDecoder().decode(FpEvent.self, from: $0) }
         // A rescan marker invalidates all later anchors.
-        if snapshot.hasRescan || events.contains(where: { $0.type == "rescan" && $0.ts > since }) {
+        if snapshot.hasRescan || events.contains(where: { $0.type == JournalEventType.rescan && $0.ts > since }) {
             throw NSFileProviderError(.syncAnchorExpired)
         }
         let relevant = events.filter { $0.ts > since }
         // One refresh request covers all older requests in this snapshot.
         // Never repeat a folder traversal once for every reconnect marker.
-        let latestRefresh = relevant.last(where: { $0.type == "refresh_presented" })?.ts
+        let latestRefresh = relevant.last(where: { $0.type == JournalEventType.refreshPresented })?.ts
         let filtered = relevant.filter {
-            ($0.type != "refresh_presented" || $0.ts == latestRefresh)
+            ($0.type != JournalEventType.refreshPresented || $0.ts == latestRefresh)
                 && changeTouchesContainer($0, container: container)
         }
         var page: [FpEvent] = []
@@ -1659,7 +1659,7 @@ final class RemoteStore {
     private func changeTouchesContainer(
         _ change: FpEvent, container: NSFileProviderItemIdentifier
     ) -> Bool {
-        if change.type == "refresh_presented" || change.type == "presented_page" {
+        if change.type == JournalEventType.refreshPresented || change.type == JournalEventType.presentedPage {
             return container == .workingSet
         }
         let fromURI = uri(forEventPath: change.from)
@@ -2264,17 +2264,17 @@ final class RemoteStore {
             for row in rows {
                 let sequence = Int64(row[0])!
                 let event = try JSONDecoder().decode(FpEvent.self, from: Data(row[1].utf8))
-                if event.type == "rescan" { return false }
-                if event.type == "presented_page", sequence > expectedHead, let page = event.presentation {
+                if event.type == JournalEventType.rescan { return false }
+                if event.type == JournalEventType.presentedPage, sequence > expectedHead, let page = event.presentation {
                     if page.items.contains(where: { protected.contains(Self.canonicalURI($0.path)) })
                         || page.deleted.contains(where: { changesMembership(Self.canonicalURI($0.uri)) }) { return false }
-                } else if ["create", "delete", "rename"].contains(event.type) {
+                } else if [JournalEventType.create, JournalEventType.delete, JournalEventType.rename].contains(event.type) {
                     if changesMembership(uri(forEventPath: event.from))
                         || event.to.map({ changesMembership(uri(forEventPath: $0)) }) == true { return false }
                 } else if sequence > expectedHead {
-                    if ["modify", "metadata"].contains(event.type), protected.contains(uri(forEventPath: event.from)) { return false }
-                    if event.type == "metadata_rescan" { return false }
-                    if event.type == "metadata_name", paths.contains(where: { $0.split(separator: "/").last.map(String.init) == event.from }) { return false }
+                    if [JournalEventType.modify, JournalEventType.metadata].contains(event.type), protected.contains(uri(forEventPath: event.from)) { return false }
+                    if event.type == JournalEventType.metadataRescan { return false }
+                    if event.type == JournalEventType.metadataName, paths.contains(where: { $0.split(separator: "/").last.map(String.init) == event.from }) { return false }
                 }
                 cursor = sequence
             }
@@ -2352,7 +2352,7 @@ final class RemoteStore {
             latest = max(latest + 1, Int64(Date().timeIntervalSince1970 * 1000))
             let itemSlice = start < items.count ? Array(items[start..<min(start + Self.changePageSize, items.count)]) : []
             let deletedSlice = start < deleted.count ? Array(deleted[start..<min(start + Self.changePageSize, deleted.count)]) : []
-            var event = FpEvent(ts: latest, type: "presented_page", from: "", to: nil, localEcho: false)
+            var event = FpEvent(ts: latest, type: JournalEventType.presentedPage, from: "", to: nil, localEcho: false)
             event.presentation = PresentedPage(items: itemSlice, deleted: deletedSlice)
             let payload = String(decoding: try JSONEncoder().encode(event), as: UTF8.self)
             try database.execute("INSERT INTO fp_events(drive,sequence,payload) VALUES(?,?,?)", [drive.id, String(latest), payload])
@@ -2502,8 +2502,8 @@ final class RemoteStore {
         let events = try snapshot.events.map { try JSONDecoder().decode(FpEvent.self, from: $0) }
         let paths = events.compactMap { event -> String? in
             switch event.type {
-            case "create", "modify", "metadata": return uri(forEventPath: event.from)
-            case "rename": return event.to.map { uri(forEventPath: $0) }
+            case JournalEventType.create, JournalEventType.modify, JournalEventType.metadata: return uri(forEventPath: event.from)
+            case JournalEventType.rename: return event.to.map { uri(forEventPath: $0) }
             default: return nil
             }
         }
