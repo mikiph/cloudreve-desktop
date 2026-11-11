@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 
 const SCHEMA: &str = include_str!("../../../macos/fileprovider/state-schema.sql");
 const EVENT_RETENTION: i64 = 100_000;
+// Additive upgrades for existing version-1 databases. Every object added to
+// state-schema.sql after the first v1 build must also be applied here (and in
+// FileProviderStateDatabase.swift rescanIndex/upgrade), because SCHEMA only
+// runs on empty databases.
 const RESCAN_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_fp_events_rescan ON fp_events(drive,sequence) WHERE CASE WHEN json_valid(payload) THEN json_extract(payload,'$.type') END='rescan';";
 
 #[derive(QueryableByName)]
@@ -321,6 +325,68 @@ fn insert_event(tx: &mut SqliteConnection, drive: &str, event: &FpEventRecord) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(QueryableByName)]
+    struct ObjectName {
+        #[diesel(sql_type = Text)]
+        value: String,
+    }
+
+    fn schema_objects(db: &mut StateDb) -> Vec<String> {
+        diesel::sql_query("SELECT type || ':' || name AS value FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY 1")
+            .load::<ObjectName>(&mut db.connection)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.value)
+            .collect()
+    }
+
+    #[test]
+    fn existing_version_one_database_gains_every_schema_object() {
+        // Databases created by the first v1 build. Must never be edited.
+        const V1_BASELINE: &str = "
+CREATE TABLE IF NOT EXISTS fp_state_schema (version INTEGER NOT NULL);
+INSERT INTO fp_state_schema SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM fp_state_schema);
+CREATE TABLE IF NOT EXISTS fp_event_heads (
+    drive TEXT PRIMARY KEY NOT NULL,
+    latest INTEGER NOT NULL DEFAULT 0,
+    floor INTEGER NOT NULL DEFAULT 0,
+    imported INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS fp_events (
+    drive TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (drive, sequence)
+);
+CREATE TABLE IF NOT EXISTS fp_records (
+    namespace TEXT NOT NULL,
+    key TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (namespace, key)
+);
+CREATE TABLE IF NOT EXISTS fp_imports (
+    namespace TEXT PRIMARY KEY NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fp_deliveries (id TEXT PRIMARY KEY NOT NULL);
+";
+        let temp_old = tempfile::tempdir().unwrap();
+        {
+            let mut raw = diesel::SqliteConnection::establish(
+                temp_old.path().join("fileprovider.db").to_str().unwrap(),
+            )
+            .unwrap();
+            raw.batch_execute(V1_BASELINE).unwrap();
+        }
+        let mut old = StateDb::at(temp_old.path()).unwrap();
+        let temp_new = tempfile::tempdir().unwrap();
+        let mut fresh = StateDb::at(temp_new.path()).unwrap();
+        assert_eq!(
+            schema_objects(&mut old),
+            schema_objects(&mut fresh),
+            "state-schema.sql gained an object that existing databases never receive; add an idempotent upgrade statement applied on every open (see RESCAN_INDEX) in both fileprovider_db.rs and FileProviderStateDatabase.swift"
+        );
+    }
 
     fn event() -> FpEventRecord {
         FpEventRecord {

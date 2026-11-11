@@ -40,6 +40,23 @@ const DOMAIN_PREFIX: &str = "cloudreve.drive.";
 const DOWNLOAD_RETRY_DIRECTORY: &str = "fileprovider-download-retries";
 const ACTIVITY_DIRECTORY: &str = "fileprovider-activity";
 const UPLOAD_RECEIPT_DIRECTORY: &str = "fileprovider-upload-receipts";
+const FINDER_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// removeDomain preserves dirty user data and can take longer.
+const DOMAIN_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wait for an NSFileProviderManager completion block. A daemon that never
+/// calls back must not hold DOMAIN_OPERATIONS or a UI request forever.
+async fn await_completion<T>(
+    rx: oneshot::Receiver<Result<T>>,
+    limit: Duration,
+    what: &str,
+) -> Result<T> {
+    match tokio::time::timeout(limit, rx).await {
+        Err(_) => Err(anyhow!("Finder did not respond to {what} within {} seconds. Try again; nothing was changed by Cloudreve.", limit.as_secs())),
+        Ok(Err(_)) => Err(anyhow!("{what} callback dropped")),
+        Ok(Ok(result)) => result,
+    }
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct FileProviderActivityRecord {
@@ -78,9 +95,25 @@ struct FileProviderUploadReceipt {
 
 pub fn matching_upload_receipt(drive_id: &str, uri: &str) -> Result<Option<crate::fileprovider_db::Record>> {
     let mut db = crate::fileprovider_db::StateDb::open()?;
-    let now = chrono::Utc::now().timestamp();
+    matching_upload_receipt_in(&mut db, drive_id, uri, chrono::Utc::now().timestamp())
+}
+
+fn matching_upload_receipt_in(
+    db: &mut crate::fileprovider_db::StateDb,
+    drive_id: &str,
+    uri: &str,
+    now: i64,
+) -> Result<Option<crate::fileprovider_db::Record>> {
     for record in db.records(UPLOAD_RECEIPT_DIRECTORY)? {
-        let receipt: FileProviderUploadReceipt = serde_json::from_str(&record.payload)?;
+        // An unreadable row must not block event commits. It is left in place:
+        // a newer build may own its format.
+        let receipt: FileProviderUploadReceipt = match serde_json::from_str(&record.payload) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::warn!(target: "fileprovider", %error, key = %record.key, "Skipping unreadable upload receipt");
+                continue;
+            }
+        };
         let age = now.saturating_sub(receipt.completed_at);
         if age > 5 * 60 {
             db.consume(UPLOAD_RECEIPT_DIRECTORY, &record)?;
@@ -359,15 +392,43 @@ pub fn append_domain_events(
     local_echo_paths: &std::collections::HashSet<String>,
     receipts: &[crate::fileprovider_db::Record],
 ) -> Result<()> {
-    let mut records = events.iter().map(|event| FpEventRecord {
+    append_domain_events_with_marker(drive_id, None, events, local_echo_paths, receipts)
+}
+
+/// Like `append_domain_events`, optionally preceded by one state marker
+/// ("rescan" or "refresh_presented") in the same transaction.
+pub fn append_domain_events_with_marker(
+    drive_id: &str,
+    marker: Option<&str>,
+    events: &[cloudreve_api::models::explorer::FileEventData],
+    local_echo_paths: &std::collections::HashSet<String>,
+    receipts: &[crate::fileprovider_db::Record],
+) -> Result<()> {
+    let mut records = build_event_records(marker, events, local_echo_paths);
+    if records.is_empty() {
+        return Ok(());
+    }
+    crate::fileprovider_db::StateDb::open()?.append_events_consuming(drive_id, &mut records, receipts)
+}
+
+/// The marker, when present, comes first so it keeps its ordering before the batch.
+fn build_event_records(
+    marker: Option<&str>,
+    events: &[cloudreve_api::models::explorer::FileEventData],
+    local_echo_paths: &std::collections::HashSet<String>,
+) -> Vec<FpEventRecord> {
+    let marker = marker.map(|kind| FpEventRecord {
+        ts: 0, event_type: kind.into(), from: String::new(),
+        to: String::new(), local_echo: false, file_id: String::new(),
+    });
+    marker.into_iter().chain(events.iter().map(|event| FpEventRecord {
         ts: 0,
         event_type: format!("{:?}", event.event_type).to_lowercase(),
         from: event.from.clone(),
         to: event.to.clone(),
         local_echo: local_echo_paths.contains(&event.from) || (!event.to.is_empty() && local_echo_paths.contains(&event.to)),
         file_id: event.file_id.clone(),
-    }).collect::<Vec<_>>();
-    crate::fileprovider_db::StateDb::open()?.append_events_consuming(drive_id, &mut records, receipts)
+    })).collect()
 }
 
 /// A bounded refresh of root and recently presented folders. Does not expire
@@ -468,8 +529,7 @@ async fn signal_error_resolved(
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("File Provider resolution callback dropped"))?
+    await_completion(rx, FINDER_CALL_TIMEOUT, "the error resolution").await
 }
 
 /// Resume File Provider operations paused with CannotSynchronize.
@@ -551,8 +611,7 @@ pub async fn retry_item_upload(
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("File Provider upload retry callback dropped"))?
+    await_completion(rx, FINDER_CALL_TIMEOUT, "the upload retry").await
 }
 
 /// Ask File Provider to retry downloading one item.
@@ -595,8 +654,7 @@ pub async fn retry_item_download(
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("File Provider download retry callback dropped"))?
+    await_completion(rx, FINDER_CALL_TIMEOUT, "the download retry").await
 }
 
 /// Refresh shared metadata in the replicated working set.
@@ -984,8 +1042,7 @@ pub async fn add_domain(domain_id: &str, display_name: &str) -> Result<()> {
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("addDomain callback dropped"))?
+    await_completion(rx, DOMAIN_LIFECYCLE_TIMEOUT, "adding the Finder location").await
 }
 
 /// Remove a domain. WARNING: this deletes the local replica of the domain
@@ -1023,8 +1080,7 @@ pub async fn remove_domain(domain_id: &str, display_name: &str) -> Result<Option
             ];
         }
     }
-    rx.await
-        .map_err(|_| anyhow!("removeDomain callback dropped"))?
+    await_completion(rx, DOMAIN_LIFECYCLE_TIMEOUT, "removing the Finder location").await
 }
 
 /// Tell macOS whether the host application is available for a registered
@@ -1337,6 +1393,32 @@ mod recovery_status_tests {
 mod lifecycle_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn completion_wait_times_out_when_finder_never_answers() {
+        let (_tx, rx) = oneshot::channel::<Result<()>>();
+        let error = await_completion(rx, Duration::from_millis(50), "test").await.unwrap_err();
+        assert!(error.to_string().contains("did not respond"));
+    }
+
+    #[tokio::test]
+    async fn completion_wait_reports_a_dropped_callback() {
+        let (tx, rx) = oneshot::channel::<Result<()>>();
+        drop(tx);
+        let error = await_completion(rx, Duration::from_secs(1), "test").await.unwrap_err();
+        assert!(error.to_string().contains("callback dropped"));
+    }
+
+    #[tokio::test]
+    async fn completion_wait_passes_through_the_result() {
+        let (tx, rx) = oneshot::channel::<Result<()>>();
+        tx.send(Ok(())).unwrap();
+        assert!(await_completion(rx, Duration::from_secs(1), "test").await.is_ok());
+        let (tx, rx) = oneshot::channel::<Result<()>>();
+        tx.send(Err(anyhow!("native"))).unwrap();
+        let error = await_completion(rx, Duration::from_secs(1), "test").await.unwrap_err();
+        assert_eq!(error.to_string(), "native");
+    }
+
     #[test]
     fn only_a_native_name_collision_allows_the_safe_suffix_fallback() {
         let error = |domain: &str, code| -> anyhow::Error {
@@ -1352,5 +1434,51 @@ mod lifecycle_tests {
     fn collision_name_uses_stable_identity_without_changing_the_domain_id() {
         assert_eq!(collision_display_name("cloudreve.drive.12345678-abc", "Cloudreve"), "Cloudreve (12345678)");
         assert_ne!(collision_display_name("cloudreve.drive.87654321-abc", "Cloudreve"), "Cloudreve (12345678)");
+    }
+}
+
+#[cfg(test)]
+mod upload_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_receipt_is_skipped_not_fatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = crate::fileprovider_db::StateDb::at(directory.path()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.put("fileprovider-upload-receipts", "bad.json", "not json").unwrap();
+        db.put(
+            "fileprovider-upload-receipts",
+            "good.json",
+            &format!(r#"{{"drive_id":"d","uri":"cloudreve://my/a","completed_at":{now}}}"#),
+        ).unwrap();
+        let found = matching_upload_receipt_in(&mut db, "d", "cloudreve://my/a", now).unwrap().unwrap();
+        assert_eq!(found.key, "good.json");
+        let keys = db.records("fileprovider-upload-receipts").unwrap().into_iter().map(|r| r.key).collect::<Vec<_>>();
+        assert!(keys.contains(&"bad.json".to_string()));
+    }
+
+    #[test]
+    fn marker_precedes_events_in_one_batch() {
+        let event = cloudreve_api::models::explorer::FileEventData {
+            event_type: cloudreve_api::models::explorer::FileEventType::Create,
+            file_id: "id".into(),
+            from: "/a".into(),
+            to: String::new(),
+        };
+        let records = build_event_records(Some("rescan"), &[event.clone()], &Default::default());
+        assert_eq!(records.iter().map(|r| r.event_type.as_str()).collect::<Vec<_>>(), ["rescan", "create"]);
+        assert!(build_event_records(None, &[], &Default::default()).is_empty());
+        let records = build_event_records(None, &[event], &Default::default());
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn marker_and_events_commit_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = crate::fileprovider_db::StateDb::at(directory.path()).unwrap();
+        let mut records = build_event_records(Some("rescan"), &[], &Default::default());
+        db.append_events_consuming("d", &mut records, &[]).unwrap();
+        assert_eq!(db.latest_event_sequence("d").unwrap(), records[0].ts);
     }
 }

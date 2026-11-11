@@ -40,13 +40,24 @@ pub fn get(id: &str) -> Result<UploadConflictRecord> {
     Ok(serde_json::from_str(&record.payload)?)
 }
 
-pub fn list() -> Result<Vec<UploadConflictRecord>> {
-    cloudreve_sync::fileprovider_db::StateDb::open()?
-        .records("upload-conflicts")?
+fn parse_conflicts(records: Vec<cloudreve_sync::fileprovider_db::Record>) -> Vec<UploadConflictRecord> {
+    records
         .into_iter()
         .filter(|record| record.key.ends_with(".json"))
-        .map(|record| serde_json::from_str(&record.payload).map_err(Into::into))
+        .filter_map(|record| match serde_json::from_str::<UploadConflictRecord>(&record.payload) {
+            Ok(conflict) => Some(conflict),
+            Err(error) => {
+                tracing::warn!(target: "fileprovider", key = %record.key, %error, "Skipping unreadable upload conflict record");
+                None
+            }
+        })
         .collect()
+}
+
+pub fn list() -> Result<Vec<UploadConflictRecord>> {
+    Ok(parse_conflicts(
+        cloudreve_sync::fileprovider_db::StateDb::open()?.records("upload-conflicts")?,
+    ))
 }
 
 pub fn set_action(id: &str, action: &str) -> Result<UploadConflictRecord> {
@@ -66,4 +77,37 @@ pub fn set_action(id: &str, action: &str) -> Result<UploadConflictRecord> {
         },
     )?;
     Ok(serde_json::from_str(&payload)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cloudreve_sync::fileprovider_db::Record;
+
+    #[test]
+    fn unreadable_conflict_does_not_hide_others() {
+        let good = UploadConflictRecord {
+            id: "0123456789abcdef".into(),
+            drive_id: "drive-1".into(),
+            drive_name: "My Files".into(),
+            uri: "cloudreve://my/a".into(),
+            item_identifier: "i".into(),
+            filename: "a".into(),
+            kind: "lock".into(),
+            application: None,
+            owner_id: None,
+            owner_name: None,
+            previous_version: None,
+            action: None,
+            presented_at: 1,
+            updated_at: 2,
+        };
+        let parsed = parse_conflicts(vec![
+            Record { key: "bad.json".into(), payload: "{".into() },
+            Record { key: "good.json".into(), payload: serde_json::to_string(&good).unwrap() },
+            Record { key: "ignored.txt".into(), payload: "x".into() },
+        ]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].drive_id, "drive-1");
+    }
 }

@@ -367,9 +367,17 @@ async fn shutdown() {
         // Mark File Provider domains unavailable before shutdown.
         #[cfg(target_os = "macos")]
         {
-            let _operation = cloudreve_sync::fileprovider::DOMAIN_OPERATIONS.lock().await;
+            let operation = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                cloudreve_sync::fileprovider::DOMAIN_OPERATIONS.lock(),
+            )
+            .await;
+            if operation.is_err() {
+                tracing::warn!(target: "main", "Finder integration is busy; marking domains disconnected without the lifecycle lock");
+            }
             let drives = state.drive_manager.list_drives().await;
             cloudreve_sync::fileprovider::set_domains_connected(&drives, false).await;
+            drop(operation);
         }
 
         // Shutdown drive manager
