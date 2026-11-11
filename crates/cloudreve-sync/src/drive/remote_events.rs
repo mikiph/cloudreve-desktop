@@ -209,7 +209,12 @@ impl Mount {
                                     Err(error) => {
                                         tracing::error!(target: "drive::remote_events", %error, attempts = EVENT_BATCH_COMMIT_ATTEMPTS, "Abandoning File Provider event batch; reconnecting to recover");
                                         let drive_id_for_marker = self.config.read().await.id.clone();
-                                        let _ = crate::fileprovider::append_rescan_marker(&drive_id_for_marker);
+                                        let _ = crate::fileprovider_db::run_blocking(move || {
+                                            crate::fileprovider::append_rescan_marker(
+                                                &drive_id_for_marker,
+                                            )
+                                        })
+                                        .await;
                                         self.set_event_push_subscribed(false).await;
                                         return ListenResult::Error {
                                             error: error.context("File Provider events could not be committed"),
@@ -365,7 +370,15 @@ impl Mount {
                     None => verified_events.push(e),
                     Some(EventVerification::Exists(info)) => {
                         let local_upload_echo = if info.file_type == file_type::FILE {
-                            match crate::fileprovider::matching_upload_receipt(&drive_id, &uri)? {
+                            let (receipt_drive, receipt_uri) = (drive_id.clone(), uri.clone());
+                            match crate::fileprovider_db::run_blocking(move || {
+                                crate::fileprovider::matching_upload_receipt(
+                                    &receipt_drive,
+                                    &receipt_uri,
+                                )
+                            })
+                            .await?
+                            {
                                 Some(receipt) => {
                                     upload_receipts.push(receipt);
                                     true
@@ -408,13 +421,20 @@ impl Mount {
             };
             let events_to_log: Vec<FileEventData> =
                 verified_events.iter().map(|e| (*e).clone()).collect();
-            crate::fileprovider::append_domain_events_with_marker(
-                &drive_id,
-                marker,
-                &events_to_log,
-                &local_upload_echo_paths,
-                &upload_receipts,
-            )?;
+            {
+                let (drive, events, echoes, receipts) = (
+                    drive_id.clone(),
+                    events_to_log.clone(),
+                    local_upload_echo_paths.clone(),
+                    upload_receipts.clone(),
+                );
+                crate::fileprovider_db::run_blocking(move || {
+                    crate::fileprovider::append_domain_events_with_marker(
+                        &drive, marker, &events, &echoes, &receipts,
+                    )
+                })
+                .await?;
+            }
             if !events_to_log.is_empty() {
                 {
                     for event in &events_to_log {

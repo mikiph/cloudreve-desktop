@@ -623,7 +623,12 @@ impl DriveManager {
             .iter()
             .filter(|drive| drive_id.map_or(true, |filter| drive.id == filter))
         {
-            let records = match crate::fileprovider::read_activity(&drive.id) {
+            let id = drive.id.clone();
+            let records = match crate::fileprovider_db::run_blocking(move || {
+                crate::fileprovider::read_activity(&id)
+            })
+            .await
+            {
                 Ok(records) => records,
                 Err(error) => {
                     tracing::warn!(
@@ -724,13 +729,19 @@ impl DriveManager {
         #[cfg(target_os = "macos")]
         for mount in read_guard.values().filter(|mount| drive_id.map_or(true, |id| mount.id == id)) {
             let flags = mount.get_status_flags().await;
+            let id = mount.id.clone();
+            let recovery = crate::fileprovider_db::run_blocking(move || {
+                crate::fileprovider::read_recovery_status(&id)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(target: "drive::manager", id = %mount.id, %error, "Could not read Finder recovery status");
+                None
+            });
             sync_health.push(SyncHealth {
                 drive_id: mount.id.clone(),
                 connected: flags.is_event_push_subscribed() && !flags.is_credential_expired(),
-                recovery: crate::fileprovider::read_recovery_status(&mount.id).unwrap_or_else(|error| {
-                    tracing::warn!(target: "drive::manager", id = %mount.id, %error, "Could not read Finder recovery status");
-                    None
-                }),
+                recovery,
             });
         }
         Ok(StatusSummary {

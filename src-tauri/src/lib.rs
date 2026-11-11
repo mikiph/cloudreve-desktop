@@ -158,8 +158,9 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
     }
 
     #[cfg(target_os = "macos")]
-    match cloudreve_sync::fileprovider_db::StateDb::open()
-        .and_then(|mut db| db.migrate_and_cleanup()) {
+    match cloudreve_sync::fileprovider_db::run_blocking(|| {
+        cloudreve_sync::fileprovider_db::StateDb::open().and_then(|mut db| db.migrate_and_cleanup())
+    }).await {
         Ok(count) => tracing::info!(count, "Migrated legacy File Provider state"),
         Err(error) => tracing::warn!(%error, "Legacy state retained; migration will retry next launch"),
     }
@@ -216,7 +217,10 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
                         // refresh pages. Wake existing work without adding a
                         // new marker or repeating the server search.
                         if connected && applied.get(&drive.id) == Some(&true) {
-                            if let Err(error) = cloudreve_sync::fileprovider::wake_pending_refresh(&drive.id, &drive.name) {
+                            let (id, name) = (drive.id.clone(), drive.name.clone());
+                            if let Err(error) = cloudreve_sync::fileprovider_db::run_blocking(move || {
+                                cloudreve_sync::fileprovider::wake_pending_refresh(&id, &name)
+                            }).await {
                                 tracing::warn!(target: "fileprovider", %error, id=%drive.id, "Could not resume pending Finder checks");
                             }
                         }
