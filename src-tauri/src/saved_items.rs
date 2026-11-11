@@ -163,10 +163,11 @@ pub async fn list_saved_items(
                 } else {
                     identities.get(&id).cloned().unwrap_or(id)
                 };
-                let Ok(uri) = validate_share_uri(&uri, &config.remote_path, &config.user_id) else {
+                let Ok((uri, relative)) =
+                    pinned_uri_and_relative(&uri, &config.remote_path, &config.user_id)
+                else {
                     continue;
                 };
-                let relative = relative_path(&uri, &config.remote_path)?;
                 let is_folder = root
                     .as_ref()
                     .map(|r| std::path::Path::new(r).join(&relative).is_dir())
@@ -480,6 +481,23 @@ async fn find_share_source(
     }
 }
 
+/// Validate a pin's identity-map URI. The map stores raw (decoded) URIs, so
+/// encode them first; otherwise `#`, `?` and `%` in names break `CrUri` parsing.
+#[cfg(any(target_os = "macos", test))]
+fn pinned_uri_and_relative(
+    raw: &str,
+    root: &str,
+    user_id: &str,
+) -> Result<(String, String), String> {
+    let uri = validate_share_uri(
+        &cloudreve_api::models::uri::encode_raw_uri(raw),
+        root,
+        user_id,
+    )?;
+    let relative = relative_path(&uri, root)?;
+    Ok((uri, relative))
+}
+
 fn relative_path(uri: &str, root: &str) -> Result<String, String> {
     use cloudreve_api::models::uri::CrUri;
     let item = CrUri::new(uri).map_err(|e| e.to_string())?;
@@ -517,6 +535,20 @@ mod tests {
             relative_path("cloudreve://my/Work", "cloudreve://my/Work").unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn pinned_raw_uris_with_special_characters_resolve() {
+        for name in ["a#b.txt", "what?.txt", "100%.txt"] {
+            let (_, relative) = pinned_uri_and_relative(
+                &format!("cloudreve://my/dir/{name}"),
+                "cloudreve://my",
+                "user",
+            )
+            .unwrap();
+            assert_eq!(relative, format!("dir/{name}"));
+            assert_eq!(relative.rsplit('/').next().unwrap(), name);
+        }
     }
 
     #[test]
