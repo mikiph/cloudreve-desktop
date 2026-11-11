@@ -155,10 +155,17 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 let prefetched = await prefetchFileInfo(for: changes)
                 try await store.batchingIdentityPersistence {
                     for change in changes {
-                        if let identifier = try await apply(change: change, to: observer, prefetched: prefetched) {
-                            if change.localEcho != true {
-                                downloadedContentUpdates.append(identifier)
+                        do {
+                            if let identifier = try await apply(change: change, to: observer, prefetched: prefetched) {
+                                if change.localEcho != true {
+                                    downloadedContentUpdates.append(identifier)
+                                }
                             }
+                        } catch where ReplayFailure.classify(error) == .permanent {
+                            logger.error(
+                                "skipping \(change.type, privacy: .public) event \(change.ts) after permanent failure: \(error.localizedDescription, privacy: .public)"
+                            )
+                            try store.requestPresentedRefresh(sequence: change.ts)
                         }
                     }
                 }
@@ -187,7 +194,9 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                             } catch CloudreveError.noSuchItem {
                                 // The remote delete superseded this update.
                             } catch {
-                                retry.append(uri)
+                                if ReplayFailure.classify(error) != .permanent {
+                                    retry.append(uri)
+                                }
                                 logger.error(
                                     "policy update item \(uri, privacy: .public) unavailable: \(error.localizedDescription, privacy: .public)"
                                 )
@@ -217,7 +226,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             } catch {
                 logger.error(
                     "enumerateChanges failed: \(error.localizedDescription, privacy: .public)")
-                observer.finishEnumeratingWithError(error)
+                observer.finishEnumeratingWithError(Self.mapError(error))
             }
         }
     }
@@ -347,6 +356,9 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     }
 
     static func mapError(_ error: Error) -> Error {
+        if ReplayFailure.classify(error) == .cancelled {
+            return CocoaError(.userCancelled)
+        }
         switch error {
         case CloudreveError.noSuchItem:
             return NSFileProviderError(.noSuchItem)
@@ -363,6 +375,14 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                         application == "upload" ? "An unfinished upload is holding this item." : "Someone has this file open online."
                 ])
         case CloudreveError.unsupportedPackage, CloudreveError.unsupportedStoragePolicy:
+            return NSError(domain: NSFileProviderErrorDomain,
+                code: NSFileProviderError.Code.cannotSynchronize.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: error.localizedDescription])
+        case CloudreveError.api(let code, _) where code < 50000:
+            return NSError(domain: NSFileProviderErrorDomain,
+                code: NSFileProviderError.Code.cannotSynchronize.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: error.localizedDescription])
+        case CloudreveError.badResponse:
             return NSError(domain: NSFileProviderErrorDomain,
                 code: NSFileProviderError.Code.cannotSynchronize.rawValue,
                 userInfo: [NSLocalizedDescriptionKey: error.localizedDescription])

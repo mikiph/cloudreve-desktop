@@ -1182,6 +1182,10 @@ final class RemoteStore {
                     }
                 } catch CloudreveError.noSuchItem {
                     // The remote delete superseded the update.
+                } catch where ReplayFailure.classify(error) == .permanent {
+                    logger.error(
+                        "pending policy update \(uri, privacy: .public) skipped: \(error.localizedDescription, privacy: .public)"
+                    )
                 }
             }
 

@@ -224,6 +224,8 @@ enum CloudreveError: Error, LocalizedError {
     case lockConflict(path: String?, application: String?, ownerID: String?)
     case badResponse(String)
     case unsupportedStoragePolicy(String)
+    /// The body was not a Cloudreve envelope (proxy error page, captive portal, empty body).
+    case invalidEnvelope(status: Int)
 
     var errorDescription: String? {
         switch self {
@@ -239,6 +241,7 @@ enum CloudreveError: Error, LocalizedError {
                 ? "An unfinished upload is holding this item"
                 : "Someone has this file open online"
         case .badResponse(let detail): return "Bad response: \(detail)"
+        case .invalidEnvelope(let status): return "The server returned an unexpected response (HTTP \(status))"
         case .unsupportedStoragePolicy(let type):
             return "This storage policy (\(type)) is not supported by the macOS Finder integration. Upload the file from the Cloudreve website instead."
         }
@@ -438,6 +441,11 @@ final class CloudreveClient {
 
     private static let authCodes: Set<Int> = [401, 40020, 40089]
 
+    private static func decodeBaseEnvelope(_ data: Data, status: Int) throws -> BaseEnvelope {
+        do { return try JSONDecoder().decode(BaseEnvelope.self, from: data) }
+        catch { throw CloudreveError.invalidEnvelope(status: status) }
+    }
+
     /// Performs an authenticated API call and unwraps the envelope.
     /// Retries once after a forced token refresh on 401.
     private func call<Req: Encodable, Res: Decodable>(
@@ -447,7 +455,7 @@ final class CloudreveClient {
         let (data, status, usedToken) = try await rawRequest(
             method, path, body: body, query: query)
         let base: BaseEnvelope? =
-            status == 401 ? nil : try JSONDecoder().decode(BaseEnvelope.self, from: data)
+            status == 401 ? nil : try Self.decodeBaseEnvelope(data, status: status)
         if status == 401 || Self.authCodes.contains(base?.code ?? 0) {
             guard retryOnAuthError else { throw CloudreveError.notAuthenticated }
             credentials.invalidate(ifAccessToken: usedToken)
@@ -505,7 +513,7 @@ final class CloudreveClient {
         let (data, status, usedToken) = try await rawRequest(
             method, path, body: body, query: [])
         let base: BaseEnvelope? =
-            status == 401 ? nil : try JSONDecoder().decode(BaseEnvelope.self, from: data)
+            status == 401 ? nil : try Self.decodeBaseEnvelope(data, status: status)
         if status == 401 || Self.authCodes.contains(base?.code ?? 0) {
             guard retryOnAuthError else { throw CloudreveError.notAuthenticated }
             credentials.invalidate(ifAccessToken: usedToken)
