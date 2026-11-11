@@ -74,6 +74,7 @@ final class RemoteStore {
     private var identityBatchDepth = 0
     private var identityBatchDirty = false
     private var identityBatchDeletedDirty = false
+    private var identityBatchPinsDirty = false
     private let identityPersistenceLock = NSLock()
     /// Explicitly pinned identifiers, persisted per drive.
     private var pinnedIdentifiers: Set<String> = []
@@ -516,8 +517,12 @@ final class RemoteStore {
             if isFolder && previousURI != uri {
                 // A folder move changes every descendant's API path, while
                 // Finder identities and pin selections must remain stable.
-                let prefix = previousURI + "/"
-                for (raw, oldURI) in Array(uriByIdentifier) where oldURI.hasPrefix(prefix) {
+                // Collect descendants before mutating the parent index.
+                let descendants: [(raw: String, oldURI: String)] =
+                    descendantIdentifiers(of: previousURI).compactMap { raw in
+                        uriByIdentifier[raw].map { (raw, $0) }
+                    }
+                for (raw, oldURI) in descendants {
                     let newURI = uri + String(oldURI.dropFirst(previousURI.count))
                     if identifierByURI[oldURI] == raw { identifierByURI.removeValue(forKey: oldURI) }
                     uriByIdentifier[raw] = newURI
@@ -573,15 +578,33 @@ final class RemoteStore {
     private func endIdentityBatch() {
         cacheLock.lock()
         identityBatchDepth -= 1
-        let flush = identityBatchDepth == 0 && identityBatchDirty
-        let flushDeleted = flush && identityBatchDeletedDirty
-        if flush {
+        let closing = identityBatchDepth == 0
+        let flushIdentities = closing && identityBatchDirty
+        let flushDeleted = closing && identityBatchDeletedDirty
+        let flushPins = closing && identityBatchPinsDirty
+        var pinnedSnapshot: [String] = []
+        if closing {
             identityBatchDirty = false
             identityBatchDeletedDirty = false
+            identityBatchPinsDirty = false
+            if flushPins { pinnedSnapshot = pinnedIdentifiers.sorted() }
         }
         cacheLock.unlock()
-        if flush { persistIdentitySnapshot([:]) }
+        if flushIdentities { persistIdentitySnapshot([:]) }
         if flushDeleted { persistDeletedIdentitySnapshot([:]) }
+        if flushPins { persistPins(pinnedSnapshot) }
+    }
+
+    /// All identities under `uri`, found via the parent index keys (one per
+    /// distinct parent folder) so unindexed intermediate folders are covered.
+    /// Call with `cacheLock` held.
+    private func descendantIdentifiers(of uri: String) -> Set<String> {
+        let prefix = uri + "/"
+        var result = Set<String>()
+        for (parent, children) in identityChildrenByParent where parent == uri || parent.hasPrefix(prefix) {
+            result.formUnion(children)
+        }
+        return result
     }
 
     private func currentIdentityRevision() -> UInt64 {
@@ -2530,20 +2553,18 @@ final class RemoteStore {
     func evictCachedItems(withIdentifiers identifiers: [NSFileProviderItemIdentifier]) {
         cacheLock.lock()
         var doomed = Set(identifiers.map { Self.canonicalIdentifier($0.rawValue) })
-        for identifier in identifiers {
-            let raw = Self.canonicalIdentifier(identifier.rawValue)
-            guard let uri = uriByIdentifier[raw] else { continue }
-            let prefix = uri + "/"
-            for (raw, mappedURI) in uriByIdentifier where mappedURI.hasPrefix(prefix) {
-                doomed.insert(raw)
-            }
+        for raw in Array(doomed) {
+            if let uri = uriByIdentifier[raw] { doomed.formUnion(descendantIdentifiers(of: uri)) }
         }
+        var identitiesChanged = false
+        var pinsChanged = false
         for raw in doomed {
             cache.removeValue(forKey: raw)
             metadataRefreshAt.removeValue(forKey: raw)
             presentedContainers.removeValue(forKey: raw)
-            pinnedIdentifiers.remove(raw)
+            if pinnedIdentifiers.remove(raw) != nil { pinsChanged = true }
             if let uri = uriByIdentifier.removeValue(forKey: raw) {
+                identitiesChanged = true
                 identityRevision &+= 1
                 identityChildrenByParent[parentPath(of: uri)]?.remove(raw)
                 lockExpiryByURI.removeValue(forKey: uri)
@@ -2553,23 +2574,24 @@ final class RemoteStore {
                 }
             }
         }
-        let identitySnapshot = uriByIdentifier
-        let deletedSnapshot = deletedIdentityURIs
+        if identityBatchDepth > 0 {
+            // Flushed once when the outermost batch closes.
+            if identitiesChanged {
+                identityBatchDirty = true
+                identityBatchDeletedDirty = true
+            }
+            if pinsChanged { identityBatchPinsDirty = true }
+            cacheLock.unlock()
+            return
+        }
         let pinnedSnapshot = pinnedIdentifiers.sorted()
         cacheLock.unlock()
 
-        persistIdentitySnapshot(identitySnapshot)
-        persistDeletedIdentitySnapshot(deletedSnapshot)
-        do {
-            try FileManager.default.createDirectory(
-                at: pinnedFileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true)
-            try JSONEncoder().encode(pinnedSnapshot).write(to: pinnedFileURL, options: .atomic)
-        } catch {
-            logger.error(
-                "failed to persist pins after remote delete: \(error.localizedDescription, privacy: .public)"
-            )
+        if identitiesChanged {
+            persistIdentitySnapshot([:])
+            persistDeletedIdentitySnapshot([:])
         }
+        if pinsChanged { persistPins(pinnedSnapshot) }
     }
 
     func recordPresentedContainer(_ identifier: NSFileProviderItemIdentifier) {

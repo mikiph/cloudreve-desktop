@@ -56,6 +56,49 @@ import FileProvider
         precondition(persisted().count == before + 1 + 51, "the batch flushes once, with every identity")
         precondition(persisted()["cloudreve-item:/B50"] == "cloudreve://my/batch/50.txt")
 
+        // Batched evictions write nothing until the batch closes.
+        let deletedFile = root.appendingPathComponent("deleted-identities-\(drive.id).json")
+        func tombstones() -> [String: String] {
+            guard let data = try? Data(contentsOf: deletedFile) else { return [:] }
+            return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+        }
+        var evictItems: [NSFileProviderItemIdentifier] = []
+        for i in 0..<20 {
+            let item = store.makeItem(file("E\(i)", path: "cloudreve://my/evict/\(i).txt"))
+            evictItems.append(item.itemIdentifier)
+        }
+        store.setPinned(true, for: evictItems[0])
+        let pinsFile = root.appendingPathComponent("pinned-\(drive.id).json")
+        func pinsOnDisk() -> [String] {
+            guard let data = try? Data(contentsOf: pinsFile) else { return [] }
+            return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+        }
+        precondition(pinsOnDisk().contains(evictItems[0].rawValue), "pin is persisted before eviction")
+        let evictBase = persisted().count
+        await store.batchingIdentityPersistence {
+            for i in 0..<10 { store.evictCachedItems(withIdentifiers: [evictItems[i]]) }
+            precondition(persisted().count == evictBase, "evictions write nothing while the batch is open")
+            precondition(pinsOnDisk().contains(evictItems[0].rawValue), "pins are not rewritten mid-batch")
+        }
+        precondition(persisted().count == evictBase - 10, "the batch flushes evictions once")
+        precondition(persisted()[evictItems[0].rawValue] == nil && persisted()[evictItems[10].rawValue] != nil)
+        precondition(tombstones()[evictItems[3].rawValue] == "cloudreve://my/evict/3.txt", "tombstones flushed")
+        precondition(!pinsOnDisk().contains(evictItems[0].rawValue), "pin removal flushed at batch close")
+
+        // Evicting a folder evicts its descendants, persisted immediately outside a batch.
+        let folder = RemoteFile(type: 1, id: "TREE", name: "tree", path: "cloudreve://my/tree",
+            size: 0, created_at: "2026-10-19T12:00:00Z", updated_at: "2026-10-19T12:00:00Z",
+            metadata: nil, shared: false, owned: true, primary_entity: nil)
+        let treeItem = store.makeItem(folder)
+        let a = store.makeItem(file("TA", path: "cloudreve://my/tree/a.txt"))
+        let b = store.makeItem(file("TB", path: "cloudreve://my/tree/sub/b.txt"))
+        precondition(persisted()[a.itemIdentifier.rawValue] != nil && persisted()[b.itemIdentifier.rawValue] != nil)
+        store.evictCachedItems(withIdentifiers: [treeItem.itemIdentifier])
+        let afterTree = persisted()
+        precondition(afterTree[treeItem.itemIdentifier.rawValue] == nil, "folder evicted immediately")
+        precondition(afterTree[a.itemIdentifier.rawValue] == nil, "child evicted immediately")
+        precondition(afterTree[b.itemIdentifier.rawValue] == nil, "grandchild evicted immediately")
+
         // The journal carries the ID; older records without it still decode.
         let withID = try JSONDecoder().decode(RemoteStore.FpEvent.self,
             from: Data(#"{"ts":1,"type":"delete","from":"/a","to":"","file_id":"A"}"#.utf8))
