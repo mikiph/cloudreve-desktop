@@ -2796,10 +2796,10 @@ final class RemoteStore {
         let folderURI = isFolder ? itemURI : parentPath(of: itemURI)
         guard var components = URLComponents(string: drive.instance_url) else { return nil }
         components.path = "/home"
-        var queryItems = [URLQueryItem(name: "path", value: folderURI)]
+        var queryItems = [URLQueryItem(name: "path", value: wireCloudreveURI(folderURI))]
         if !isFolder {
             queryItems.append(
-                URLQueryItem(name: "open", value: item.remoteID ?? itemURI))
+                URLQueryItem(name: "open", value: item.remoteID ?? wireCloudreveURI(itemURI)))
         }
         if let userID = drive.user_id, !userID.isEmpty {
             queryItems.append(URLQueryItem(name: "user_hint", value: userID))

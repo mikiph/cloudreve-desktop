@@ -50,13 +50,15 @@ private final class QueryProtocol: URLProtocol {
         let client = CloudreveClient(drive: drive, session: URLSession(configuration: config))
         _ = try await client.fileInfo(uri: "cloudreve://my/C++ notes.txt")
         let raw = QueryProtocol.rawQueries.last!
-        precondition(raw.contains("C%2B%2B%20notes.txt"), "raw query: \(raw)")
+        precondition(QueryProtocol.decodedURIs.last == "cloudreve://my/C%2B%2B%20notes.txt",
+            "uri: \(QueryProtocol.decodedURIs.last ?? "nil")")
+        precondition(raw.contains("C%252B%252B%2520notes.txt"), "raw query: \(raw)")
         precondition(!raw.contains("+"), "raw query: \(raw)")
 
         // 4. Non-ASCII.
         let unicode = "cloudreve://my/Grüße.txt"
         _ = try await client.fileInfo(uri: unicode)
-        precondition(QueryProtocol.decodedURIs.last == unicode)
+        precondition(QueryProtocol.decodedURIs.last == "cloudreve://my/Gr%C3%BC%C3%9Fe.txt")
 
         print("QueryEncodingTests: all tests passed")
     }
