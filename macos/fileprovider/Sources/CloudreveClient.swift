@@ -51,7 +51,7 @@ enum DriveStore {
             return drive
         } catch {
             logger.error(
-                "failed to read \(drivesURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                "failed to read \(drivesURL.path, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
             )
             return nil
         }
@@ -896,7 +896,7 @@ final class CloudreveClient {
             throw error
         }
         try FileProviderStateDatabase().remove("fileprovider-upload-sessions", sessionKey)
-        logger.info("uploaded \(uri, privacy: .public) (\(size) bytes, chunks ok)")
+        logger.info("uploaded \(uri, privacy: .private(mask: .hash)) (\(size) bytes, chunks ok)")
     }
 
     private func cancelUploadSession(credential: UploadCredentialPayload, uri: String)

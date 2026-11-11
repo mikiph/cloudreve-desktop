@@ -15,7 +15,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         self.containerIdentifier = containerIdentifier
         self.store = store
         super.init()
-        logger.debug("enumerator init for \(containerIdentifier.rawValue, privacy: .public)")
+        logger.debug("enumerator init for \(containerIdentifier.rawValue, privacy: .private(mask: .hash))")
     }
 
     func invalidate() {}
@@ -79,7 +79,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 }
             } catch {
                 logger.error(
-                    "enumerateItems failed for \(self.containerIdentifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    "enumerateItems failed for \(self.containerIdentifier.rawValue, privacy: .private(mask: .hash)): \(error.localizedDescription, privacy: .public)"
                 )
                 observer.finishEnumeratingWithError(Self.mapError(error))
             }
@@ -91,7 +91,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         from anchor: NSFileProviderSyncAnchor
     ) {
         logger.info(
-            "enumerateChanges for \(self.containerIdentifier.rawValue, privacy: .public) from \(String(data: anchor.rawValue, encoding: .utf8) ?? "?", privacy: .public)"
+            "enumerateChanges for \(self.containerIdentifier.rawValue, privacy: .private(mask: .hash)) from \(String(data: anchor.rawValue, encoding: .utf8) ?? "?", privacy: .public)"
         )
         Task {
             do {
@@ -105,7 +105,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     let items = try await store.currentChildren(of: containerIdentifier)
                     if !items.isEmpty {
                         logger.notice(
-                            "refreshing \(items.count) presented item(s) in \(self.containerIdentifier.rawValue, privacy: .public)"
+                            "refreshing \(items.count) presented item(s) in \(self.containerIdentifier.rawValue, privacy: .private(mask: .hash))"
                         )
                         observer.didUpdate(items)
                     }
@@ -198,7 +198,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                                     retry.append(uri)
                                 }
                                 logger.error(
-                                    "policy update item \(uri, privacy: .public) unavailable: \(error.localizedDescription, privacy: .public)"
+                                    "policy update item \(uri, privacy: .private(mask: .hash)) unavailable: \(error.localizedDescription, privacy: .public)"
                                 )
                             }
                         }
@@ -220,7 +220,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 store.scheduleDownloadedContentRefresh(downloadedContentUpdates)
             } catch let error as NSFileProviderError where error.code == .syncAnchorExpired {
                 logger.info(
-                    "anchor expired for \(self.containerIdentifier.rawValue, privacy: .public); system will re-enumerate"
+                    "anchor expired for \(self.containerIdentifier.rawValue, privacy: .private(mask: .hash)); system will re-enumerate"
                 )
                 observer.finishEnumeratingWithError(error)
             } catch {
@@ -293,7 +293,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         }
         let fromURI = store.uri(forEventPath: change.from)
         logger.notice(
-            "applying \(change.type, privacy: .public) for \(fromURI, privacy: .public)"
+            "applying \(change.type, privacy: .public) for \(fromURI, privacy: .private(mask: .hash))"
         )
         switch change.type {
         case JournalEventType.create, JournalEventType.modify, JournalEventType.metadata:
@@ -309,7 +309,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 let refreshContent = containerIdentifier == .workingSet
                     && change.type == JournalEventType.modify && !file.isFolder && change.localEcho != true
                 logger.notice(
-                    "refreshed \(fromURI, privacy: .public), shared: \(file.shared == true, privacy: .public)"
+                    "refreshed \(fromURI, privacy: .private(mask: .hash)), shared: \(file.shared == true, privacy: .public)"
                 )
                 observer.didUpdate([item])
                 return refreshContent ? item.itemIdentifier : nil
@@ -321,7 +321,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         case JournalEventType.delete:
             let identifier = store.identifierForRemoteDelete(uri: fromURI, fileID: change.fileID)
             logger.notice(
-                "delivering remote delete for \(fromURI, privacy: .public) as \(identifier.rawValue, privacy: .public)"
+                "delivering remote delete for \(fromURI, privacy: .private(mask: .hash)) as \(identifier.rawValue, privacy: .private(mask: .hash))"
             )
             store.recordRemoteDelete(for: fromURI)
             store.evictCachedItems(withIdentifiers: [identifier])
