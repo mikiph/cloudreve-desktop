@@ -1104,6 +1104,52 @@ final class RemoteStore {
         let freshListings: [String: Set<String>]
         /// Containers proven absent on the server.
         let extinctURIs: [String]
+        /// Identities confirmed gone by lookup after a fresh listing omitted them.
+        let verifiedGone: Set<String>
+    }
+
+    /// Confirms which missing candidates are really gone. Pagination is not a
+    /// server snapshot, so absence from a listing alone never proves deletion.
+    /// Candidates whose lookup fails for any other reason stay unverified.
+    private func verifyMissingCandidates(_ candidates: [String: String]) async
+        -> (gone: Set<String>, stillPresent: [RemoteFile])
+    {
+        guard !candidates.isEmpty else { return ([], []) }
+        var checked = candidates
+        if candidates.count > 500 {
+            let keep = Set(candidates.keys.sorted().prefix(500))
+            checked = candidates.filter { keep.contains($0.key) }
+            logger.notice(
+                "verifying 500 of \(candidates.count, privacy: .public) missing candidates; rest stay unverified"
+            )
+        }
+        let results = await FileInfoPrefetch.fetch(Array(Set(checked.values)), using: client)
+        var gone: Set<String> = []
+        var stillPresent: [RemoteFile] = []
+        for (raw, uri) in checked {
+            guard let result = results[uri] else { continue }
+            switch result {
+            case .failure(let error):
+                if case CloudreveError.noSuchItem = error {
+                    gone.insert(raw)
+                } else {
+                    logger.error(
+                        "missing candidate \(raw, privacy: .public) unverified: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            case .success(let file):
+                let remoteIdentifier =
+                    file.presentationIdentity ?? ItemIdentity.remoteID(file.id, fallbackURI: file.path)
+                if raw.hasPrefix(ItemIdentity.remotePrefix),
+                    Self.canonicalIdentifier(remoteIdentifier) != Self.canonicalIdentifier(raw)
+                {
+                    gone.insert(raw)
+                } else {
+                    stillPresent.append(file)
+                }
+            }
+        }
+        return (gone, stillPresent)
     }
 
     /// Return the current working set, including pinned subtrees.
@@ -1244,6 +1290,7 @@ final class RemoteStore {
             self.uri(for: NSFileProviderItemIdentifier($0))
         }
         var pruned: [NSFileProviderItemIdentifier] = []
+        var missing: [String: String] = [:]
         for (rawIdentifier, item) in itemsByIdentifier {
             if extinctContainers.contains(rawIdentifier)
                 || extinctURIs.contains(where: { extinct in
@@ -1256,9 +1303,18 @@ final class RemoteStore {
             }
             let parent = item.parentItemIdentifier.rawValue
             if let present = freshListings[parent], !present.contains(rawIdentifier) {
-                itemsByIdentifier.removeValue(forKey: rawIdentifier)
+                missing[rawIdentifier] = self.uri(for: item.itemIdentifier)
+            }
+        }
+        // Absence from a paged listing is not proof of deletion.
+        let verification = await verifyMissingCandidates(missing)
+        for raw in verification.gone {
+            if let item = itemsByIdentifier.removeValue(forKey: raw) {
                 pruned.append(item.itemIdentifier)
             }
+        }
+        for file in verification.stillPresent {
+            add(makeItem(file))
         }
         if !pruned.isEmpty {
             evictCachedItems(withIdentifiers: pruned)
@@ -1266,7 +1322,8 @@ final class RemoteStore {
         return WorkingSetSnapshot(
             items: Array(itemsByIdentifier.values),
             freshListings: freshListings,
-            extinctURIs: extinctURIs)
+            extinctURIs: extinctURIs,
+            verifiedGone: verification.gone)
     }
 
     /// Item versions currently in the session cache, for change detection.
@@ -1323,6 +1380,7 @@ final class RemoteStore {
 
         let rootRaw = NSFileProviderItemIdentifier.rootContainer.rawValue
         var deleted: [NSFileProviderItemIdentifier] = []
+        var toVerify: [String: String] = [:]
         for (raw, uri) in identities where !currentIDs.contains(raw) {
             if snapshot.extinctURIs.contains(where: { uri == $0 || uri.hasPrefix($0 + "/") }) {
                 deleted.append(NSFileProviderItemIdentifier(raw))
@@ -1333,7 +1391,17 @@ final class RemoteStore {
             guard let parentRaw, let present = snapshot.freshListings[parentRaw],
                 !present.contains(raw)
             else { continue }
-            deleted.append(NSFileProviderItemIdentifier(raw))
+            if snapshot.verifiedGone.contains(raw) {
+                deleted.append(NSFileProviderItemIdentifier(raw))
+            } else {
+                toVerify[raw] = uri
+            }
+        }
+        let (gone, _) = await verifyMissingCandidates(toVerify)
+        if !gone.isEmpty {
+            let ids = gone.sorted().map { NSFileProviderItemIdentifier($0) }
+            deleted.append(contentsOf: ids)
+            evictCachedItems(withIdentifiers: ids)
         }
         return (updated, deleted)
     }
