@@ -105,6 +105,9 @@ final class RemoteStore {
     // Keep this bounded to avoid turning a reconnect into a full-drive crawl.
     private static let presentedContainerLimit = 128
     private let cacheLock = NSLock()
+    /// Serializes the read-modify-write of pending-pinned-<drive>.json.
+    /// Never take cacheLock while holding this lock, or the reverse.
+    private let pendingPolicyUpdatesLock = NSLock()
     private let pinRequestLock = NSLock()
     private let stateDirectoryOverride: URL?
     private let pinRequestDirectoryOverride: URL?
@@ -697,11 +700,9 @@ final class RemoteStore {
 
     /// Queue items whose content policy changed.
     func recordPendingItemUpdates(uris: [String]) {
-        cacheLock.lock()
+        pendingPolicyUpdatesLock.lock()
         var pending = readPendingPolicyUpdates()
         pending.formUnion(uris)
-        policyRescanPending = true
-        cacheLock.unlock()
         do {
             try FileManager.default.createDirectory(
                 at: pendingPolicyUpdatesFileURL.deletingLastPathComponent(),
@@ -712,6 +713,10 @@ final class RemoteStore {
             logger.error(
                 "failed to persist pending item updates: \(error.localizedDescription, privacy: .public)")
         }
+        pendingPolicyUpdatesLock.unlock()
+        cacheLock.lock()
+        policyRescanPending = true
+        cacheLock.unlock()
         persistPolicyRescanMarker()
     }
 
@@ -723,16 +728,16 @@ final class RemoteStore {
     }
 
     private func pendingItemUpdatesSnapshot() -> Set<String> {
-        cacheLock.lock()
-        defer { cacheLock.unlock() }
+        pendingPolicyUpdatesLock.lock()
+        defer { pendingPolicyUpdatesLock.unlock() }
         return readPendingPolicyUpdates()
     }
 
     /// Take queued policy updates, clearing the persisted list.
     func takePendingItemUpdates() -> [String] {
-        cacheLock.lock()
+        pendingPolicyUpdatesLock.lock()
+        defer { pendingPolicyUpdatesLock.unlock() }
         let pending = readPendingPolicyUpdates()
-        cacheLock.unlock()
         try? FileManager.default.removeItem(at: pendingPolicyUpdatesFileURL)
         return pending.sorted()
     }
