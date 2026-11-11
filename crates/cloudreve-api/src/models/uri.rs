@@ -501,3 +501,29 @@ pub fn new_my_uri(uid: Option<&str>) -> Result<CrUri> {
         None => CrUri::new("cloudreve://my"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shared with macos/fileprovider/Tests/UriWireEncodingTests.swift.
+    /// Both sides must produce exactly these strings.
+    #[test]
+    fn join_encodes_segments_like_the_macos_extension() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["a b.txt"], "cloudreve://my/a%20b.txt"),
+            (&["what?.txt"], "cloudreve://my/what%3F.txt"),
+            (&["#1 notes.md"], "cloudreve://my/%231%20notes.md"),
+            (&["100%.txt"], "cloudreve://my/100%25.txt"),
+            (&["C++ & co", "x=y.txt"], "cloudreve://my/C%2B%2B%20%26%20co/x%3Dy.txt"),
+            (&["Grüße.txt"], "cloudreve://my/Gr%C3%BC%C3%9Fe.txt"),
+            (&["(draft) it's!~*.txt"], "cloudreve://my/(draft)%20it's!~*.txt"),
+            (&["a:b;c,d@e$f.txt"], "cloudreve://my/a%3Ab%3Bc%2Cd%40e%24f.txt"),
+        ];
+        for (segments, expected) in cases {
+            let mut uri = CrUri::new("cloudreve://my").unwrap();
+            uri.join(segments);
+            assert_eq!(&uri.to_string(), expected, "segments {:?}", segments);
+        }
+    }
+}

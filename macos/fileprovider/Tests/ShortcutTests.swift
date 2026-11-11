@@ -23,8 +23,9 @@ private final class MockProtocol: URLProtocol {
         }
         let body = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any] ?? [:]
         Self.bodies.append(body)
-        let uri = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        let rawURI = URLComponents(url: url, resolvingAgainstBaseURL: false)!
             .queryItems?.first { $0.name == "uri" }?.value ?? body["uri"] as? String ?? ""
+        let uri = rawURI.removingPercentEncoding ?? rawURI
         Self.requests.append((endpoint, uri))
         let name = uri.components(separatedBy: "/").last ?? ""
         var file: [String: Any] = [
@@ -140,13 +141,13 @@ enum ShortcutTests {
         precondition(refreshed.path == shortcut + "/child.txt")
         precondition(refreshed.presentationIdentity == result.files[0].presentationIdentity)
         _ = try await client.createFileOrFolder(uri: shortcut + "/new folder", isFolder: true)
-        precondition(MockProtocol.bodies.last?["uri"] as? String == target + "/new folder")
+        precondition(MockProtocol.bodies.last?["uri"] as? String == "cloudreve://share-id@shared_with_me/new%20folder")
         precondition(!MockProtocol.requests.contains { $0 == "/file/info" && $1.hasSuffix("/new folder") })
         let renamed = try await client.renameFile(uri: shortcut + "/child.txt", to: "renamed.txt")
         precondition(MockProtocol.bodies.last?["uri"] as? String == target + "/child.txt")
         precondition(renamed.path == shortcut + "/renamed.txt")
         try await client.deleteFile(uri: shortcut)
-        precondition(MockProtocol.bodies.last?["uris"] as? [String] == [shortcut])
+        precondition(MockProtocol.bodies.last?["uris"] as? [String] == ["cloudreve://my/Test%20Delt%20Mappe"])
         try await client.deleteFile(uri: shortcut + "/child.txt")
         precondition(MockProtocol.bodies.last?["uris"] as? [String] == [target + "/child.txt"])
         try await client.moveFile(uri: "cloudreve://my/ordinary.txt", toDirectory: shortcut)

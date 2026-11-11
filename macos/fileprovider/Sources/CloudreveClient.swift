@@ -287,6 +287,35 @@ func strictlyEncodedQueryItems(_ items: [URLQueryItem]) -> [URLQueryItem] {
     }
 }
 
+/// Characters JavaScript's encodeURIComponent leaves unescaped. Cloudreve's web
+/// client and the Rust `CrUri::join` encode every URI path segment with this set.
+private let uriComponentAllowed: CharacterSet = {
+    var set = CharacterSet()
+    set.insert(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()")
+    return set
+}()
+
+/// The form of a Cloudreve URI sent to the server: every path segment is
+/// percent-encoded like encodeURIComponent; the `cloudreve://<authority>`
+/// prefix is kept verbatim. The extension stores URIs decoded, so this is
+/// applied only where a URI leaves the process. Idempotent: an already
+/// encoded URI (for example a server-provided share redirect) is unchanged.
+func wireCloudreveURI(_ uri: String) -> String {
+    let prefix = "cloudreve://"
+    guard uri.hasPrefix(prefix) else { return uri }
+    let rest = uri.dropFirst(prefix.count)
+    guard let slash = rest.firstIndex(of: "/") else { return uri }
+    let authority = rest[..<slash]
+    let segments = rest[rest.index(after: slash)...]
+        .split(separator: "/", omittingEmptySubsequences: false)
+    let encoded = segments.map { segment -> String in
+        let raw = String(segment)
+        let decoded = raw.removingPercentEncoding ?? raw
+        return decoded.addingPercentEncoding(withAllowedCharacters: uriComponentAllowed) ?? raw
+    }
+    return prefix + authority + "/" + encoded.joined(separator: "/")
+}
+
 /// Maps Cloudreve API error codes to typed errors.
 func mapApiError(code: Int, message: String?, responseData: Data? = nil) -> CloudreveError {
     switch code {
@@ -480,7 +509,14 @@ final class CloudreveClient {
     ) async throws -> (Data, Int, String) {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("/api/v4\(path)"), resolvingAgainstBaseURL: false)!
-        if !query.isEmpty { components.percentEncodedQueryItems = strictlyEncodedQueryItems(query) }
+        if !query.isEmpty {
+            let wire = query.map { item in
+                item.name == "uri"
+                    ? URLQueryItem(name: "uri", value: item.value.map(wireCloudreveURI))
+                    : item
+            }
+            components.percentEncodedQueryItems = strictlyEncodedQueryItems(wire)
+        }
 
         var request = URLRequest(url: components.url!)
         request.httpMethod = method
@@ -726,7 +762,7 @@ final class CloudreveClient {
         let target = try await resolvedURI(uri, followLeaf: false)
         let file: RemoteFile = try await call(
             "POST", "/file/create",
-            body: Body(uri: target, type: isFolder ? "folder" : "file"))
+            body: Body(uri: wireCloudreveURI(target), type: isFolder ? "folder" : "file"))
         return target == uri ? file : file.presented(at: uri)
     }
 
@@ -737,7 +773,7 @@ final class CloudreveClient {
         }
         let target = try await resolvedURI(uri, followLeaf: false)
         let file: RemoteFile = try await call(
-            "POST", "/file/rename", body: Body(uri: target, new_name: newName))
+            "POST", "/file/rename", body: Body(uri: wireCloudreveURI(target), new_name: newName))
         return target == uri ? file : file.presented(
             at: ShortcutResolver.child(newName, of: ShortcutResolver.parent(uri)))
     }
@@ -750,7 +786,7 @@ final class CloudreveClient {
         }
         let uri = try await resolvedURI(uri, followLeaf: false)
         let dstURI = try await resolvedURI(dstURI, followLeaf: true)
-        try await callVoid("POST", "/file/move", body: Body(uris: [uri], dst: dstURI))
+        try await callVoid("POST", "/file/move", body: Body(uris: [wireCloudreveURI(uri)], dst: wireCloudreveURI(dstURI)))
     }
 
     /// Deleting locally may supersede an interrupted upload from this desktop.
@@ -772,7 +808,7 @@ final class CloudreveClient {
                     try db.remove("fileprovider-upload-sessions", record[0])
                     continue
                 }
-                try await callVoid("DELETE", "/file/upload", body: Body(id: id, uri: path))
+                try await callVoid("DELETE", "/file/upload", body: Body(id: id, uri: wireCloudreveURI(path)))
             } catch CloudreveError.noSuchItem {
                 // A completed or already-cancelled session needs no further cancellation.
             }
@@ -786,7 +822,7 @@ final class CloudreveClient {
             let uris: [String]
         }
         let uri = try await resolvedURI(uri, followLeaf: false)
-        try await callVoid("DELETE", "/file", body: Body(uris: [uri]))
+        try await callVoid("DELETE", "/file", body: Body(uris: [wireCloudreveURI(uri)]))
     }
 
     // MARK: Upload
@@ -853,7 +889,7 @@ final class CloudreveClient {
         let credential: UploadCredentialPayload = try await call(
             "PUT", "/file/upload",
             body: SessionRequest(
-                uri: uri, size: size, policy_id: "",
+                uri: wireCloudreveURI(uri), size: size, policy_id: "",
                 last_modified: mtime,
                 entity_type: overwrite ? "version" : nil,
                 encryption_supported: [UploadEncryptor.supportedAlgorithm],
@@ -908,7 +944,7 @@ final class CloudreveClient {
         }
         try await callVoid(
             "DELETE", "/file/upload",
-            body: Body(id: credential.session_id, uri: uri))
+            body: Body(id: credential.session_id, uri: wireCloudreveURI(uri)))
         try FileProviderStateDatabase().remove("fileprovider-upload-sessions",
             driveID + ":" + credential.session_id)
     }
@@ -969,7 +1005,7 @@ final class CloudreveClient {
             let download: Bool
         }
         let payload: FileURLPayload = try await call(
-            "POST", "/file/url", body: Body(uris: [uri], download: true))
+            "POST", "/file/url", body: Body(uris: [wireCloudreveURI(uri)], download: true))
         guard let first = payload.urls.first, let url = URL(string: first.url) else {
             throw CloudreveError.badResponse("no download URL")
         }
