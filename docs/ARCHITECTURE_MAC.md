@@ -139,8 +139,10 @@ Full check performs the previous metadata-only traversal in pages of 200. It
 preserves downloads, pins and domain identity. A complete pass alone infers
 missing inventory items as deletions, collapsing descendants of missing folders.
 It refreshes Finder's working set and updates the incremental checkpoint after
-success. An empty inventory establishes a baseline without creating activity
-for every existing file. Received-share redirects are not recursively traversed.
+success. Until a Full check has completed for the current root, the inventory holds
+only what incremental searches returned. Such a pass reports renames and
+modifications of known items but does not create activity for every unknown
+file, and its completion records the baseline used by later Full checks. Received-share redirects are not recursively traversed.
 Full check is never scheduled automatically by startup, reconnect or menu refresh.
 
 API references: [List files](https://cloudrevev4.apifox.cn/list-files-300233178e0),
