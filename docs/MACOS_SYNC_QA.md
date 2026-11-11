@@ -94,14 +94,7 @@ successful resumable-upload validation.
 cargo check -p cloudreve-desktop
 cargo test -p cloudreve-desktop --lib popup_position_tests
 cargo test -p cloudreve-sync --lib fileprovider
-bash macos/scripts/test-state-database.sh
-bash macos/scripts/test-presented-refresh.sh
-bash macos/scripts/test-downloaded-refresh.sh
-bash macos/scripts/test-remote-delete-identity.sh
-bash macos/scripts/test-file-info-prefetch.sh
-FP_SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)" bash macos/scripts/test-pin-requests.sh
-FP_SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)" bash macos/scripts/test-file-provider-activity.sh
-FP_SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)" bash macos/scripts/test-reset-request.sh
+bash macos/scripts/test-all.sh
 npm run build --prefix ui
 ```
 

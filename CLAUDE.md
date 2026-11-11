@@ -52,18 +52,19 @@ cargo tauri build              # Production build
 
 - `fileprovider/Sources/`: Swift `NSFileProviderReplicatedExtension` backed by the Cloudreve API — enumerates directories, downloads file contents on demand, and supports mutations (create/upload, rename, move, delete-to-trash; local/relay storage policies only). Reads `~/.cloudreve/drives.json` via a sandbox temporary-exception (local dev only; use an app group for distribution).
 - On macOS, drives are **File Provider only**: `Mount::start()` is a no-op (no sync folder, no FS watcher, no initial sync), `MountCommand::Sync` is ignored, and `get_drives_info` reports the domain's user-visible URL (`~/Library/CloudStorage/...`) instead of `sync_path`.
-- Remote-change feed: the app's SSE listener (`remote_events.rs`) appends events to `~/.cloudreve/fp-events/<drive-id>.jsonl` and calls `signalEnumerator(workingSet)` — the extension replays the log in `enumerateChanges`. The extension itself cannot hold a long-lived SSE connection (XPC services are suspended when idle). Only the working-set container may be signaled for replicated extensions (per NSFileProviderManager.h docs); anchors are event timestamps (`evt-<millis>`), unknown anchors yield `syncAnchorExpired` (full rescan).
+- Remote-change feed: the app's SSE listener (`remote_events.rs`) commits events to the `fp_events` journal in `~/.cloudreve/fileprovider.db` (SQLite, shared with the extension) and calls `signalEnumerator(workingSet)` — the extension replays the journal in `enumerateChanges`. The extension itself cannot hold a long-lived SSE connection (XPC services are suspended when idle). Only the working-set container may be signaled for replicated extensions (per NSFileProviderManager.h docs); anchors are `evt-<sequence>` where the sequence is allocated as `max(now_ms, latest+1)`; unknown or pruned anchors yield `syncAnchorExpired` (full rescan).
 - Client IDs: the app sends `X-Cr-Client-Id` derived from the drive UUID (`api_client_id` in mounts.rs) — sharing one ID across processes breaks the server-side event channel.
 - `fileprovider/Support/`: appex `Info.plist` (`com.apple.fileprovider-nonui` extension point) and entitlements
 - `fpctl/fpctl.swift`: generic CLI to list/add/remove FP domains; run it from inside a host app bundle to manage that bundle's domains
 - `testhost/`: minimal host app for testing the extension without building the Tauri app
 - `scripts/build-extension.sh`: builds the appex with raw `swiftc` (no Xcode project), ad-hoc signs it
 - `scripts/embed-into-app.sh`: embeds the appex into a built `Cloudreve.app`, re-signs, refreshes LS/pluginkit — run after every `cargo tauri build --bundles app`
+- Swift tests: `bash macos/scripts/test-all.sh` runs every `macos/scripts/test-*.sh` suite (also run in CI)
 
 #### macOS synchronization and share-state rules
 
 - Cloudreve file IDs are the canonical identity. `NSFileProviderItemIdentifier` values and persisted metadata maps must be keyed by the stable remote ID, never by a filename or path. URIs are lookup locations and may change after rename or move; update the ID-to-URI map while preserving the item identifier.
-- The host app owns one SSE subscription per drive. It uses a fresh client ID for every subscription attempt, writes verified remote events to the drive's JSONL feed, and signals the working-set container. The File Provider extension replays that feed; it must not open its own long-lived SSE connection or crawl the whole drive for each event.
+- The host app owns one SSE subscription per drive. It uses a fresh client ID for every subscription attempt, writes verified remote events to the shared `fp_events` journal, and signals the working-set container. The File Provider extension replays that journal; it must not open its own long-lived SSE connection or crawl the whole drive for each event.
 - Create/modify events are verified with `/file/info` before being queued. An invalid event path, a reconnect, or a missed-event gap records a rescan marker. Full reconciliation is reserved for those cases and must deliver explicit updates/deletions rather than relying on omitted working-set items disappearing.
 - Finder folder enumeration is demand-driven. Record containers when Finder presents them and refresh only the root plus recently presented containers (bounded and persisted) when a working-set signal arrives. Do not add periodic full-drive polling or recursively enumerate unopened subfolders.
 - Share state comes from the extended file metadata (`shared` and ownership flags), not from filenames or stale share-link UI state. The share create/edit/delete commands signal a targeted metadata refresh; remote share events use the same metadata refresh path. `makeItem` must include the share flags in `itemVersion.metadataVersion` so Finder redraws the decoration.
@@ -93,8 +94,8 @@ Endpoints used by the extension (all under `{instance_url}/api/v4`, auth via `Au
 #### NSFileProvider implementation knowledge (hard-won)
 
 - Replicated extensions only honor `signalEnumerator` for the **working-set container**; per-container signals are silently ignored (see NSFileProviderManager.h).
-- XPC services are suspended when idle — no long-lived SSE in the extension; the app owns the event stream and shares events via `~/.cloudreve/fp-events/<drive-id>.jsonl` (JSON lines: `{ts, type, from, to}`; `type: "rescan"` forces a full rescan).
-- Sync anchors are `evt-<millis>` event-log timestamps; unknown anchors → `syncAnchorExpired` → full rescan (safe recovery after extension restarts).
+- XPC services are suspended when idle — no long-lived SSE in the extension; the app owns the event stream and shares events through the `fp_events` table in `~/.cloudreve/fileprovider.db` (JSON payload: `ts`, `type`, `from`, `to`, `local_echo`, `file_id`, `presentation`). `type: "rescan"` expires anchors. The legacy `~/.cloudreve/fp-events/*.jsonl` files are only imported once on upgrade.
+- Sync anchors are `evt-<sequence>` journal sequences (monotonic, >= the current millisecond timestamp); the journal keeps the latest 100,000 events per drive. Unknown anchors → `syncAnchorExpired` → reconciliation (safe recovery after extension restarts).
 - Declaring the trash container unsupported (`enumerator(for: .trashContainer)` throws `NSFeatureUnsupportedError`) makes the system route Finder "Move to Trash" straight to `deleteItem`, which soft-deletes to the server trash.
 - Items returned to the system must have an `itemVersion` or the extension crashes (`__FILEPROVIDER_BAD_ITEM_MISSING_ITEMVERSION__`).
 - The session item cache is append-only; `workingSetItems()` seeds from it. Without pruning, remotely deleted items are resurrected on every working-set re-enumeration (which rescan markers force on each SSE reconnect) and never disappear from Finder. The working set must drop items that fresh listings prove are gone, and confirmed deletes must evict the cache (`evictCachedItems`).
@@ -102,13 +103,13 @@ Endpoints used by the extension (all under `{instance_url}/api/v4`, auth via `Au
 - "Keep Downloaded" uses `contentPolicy`, custom File Provider actions, and `userInfo` activation keys. Pin state is persisted per drive; actions refresh the working set, request downloads for known files, and explicitly evict content when unpinned. Effective pins receive the File Provider badge from the appex resources.
 - Cloudreve's documented REST metadata has no lock-status query. File Provider marks an item read-only and adds a Locked badge after Cloudreve reports a 40073 conflict; proactive WOPI lock display would require a server-side lock-status endpoint or the WOPI session token.
 - Optimized extension builds crash (`__cxa_pure_virtual` in `AsyncTask::completeFuture`) when a `withTaskGroup` child returns `(String, Result<RemoteFile, Error>)`. Use unstructured `Task` waves instead (`FileInfoPrefetch`) and test concurrency with `-O`; a debug/TSan run passes.
-- Keep Downloaded queues policy updates in `pending-pinned-<drive-id>.json` and uses `~/Library/Application Support/CloudreveFileProvider/` because the extension cannot write to the shared event log. Await download/eviction retries inside the action's XPC call.
+- Keep Downloaded queues policy updates in `pending-pinned-<drive-id>.json` and uses `~/Library/Application Support/CloudreveFileProvider/` (the extension's private policy state stays in its own container). Await download/eviction retries inside the action's XPC call.
 
 macOS development notes:
-- The dev build uses bundle id `cloudreve.desktop.dev` so it never clashes with an installed `/Applications/Cloudreve.app` (`NSFileProviderManager` resolves providers per host bundle id).
+- The app uses bundle id `cloudreve.desktop` (extension `cloudreve.desktop.fileprovider`); `.dev` IDs exist only as a legacy migration source. `NSFileProviderManager` resolves providers per host bundle id, so don't run two builds with the same ID.
 - New File Provider domains start **user-disabled**; enable once in System Settings → General → Login Items & Extensions → File Providers.
 - `pluginkit -a <appex>` is needed to register hand-built extensions; `fileproviderctl dump <domain>` shows sync engine state.
-- `log` is a zsh builtin — use `/usr/bin/log stream --predicate 'subsystem == "cloudreve.desktop.dev.fileprovider"'` for extension logs.
+- `log` is a zsh builtin — use `/usr/bin/log stream --predicate 'subsystem == "cloudreve.desktop.fileprovider"'` for extension logs.
 
 #### macOS upgrade-safe build procedure
 
@@ -116,13 +117,13 @@ Never distribute the raw bundle produced by `cargo tauri build`/`tauri build`: i
 
 ```bash
 npx --yes @tauri-apps/cli@2.11.4 build --bundles app
-FP_CONFIGURATION=Release FP_SHORT_VERSION=0.2.0 FP_BUILD_NUMBER=<new-number> \
+FP_CONFIGURATION=Release FP_BUILD_NUMBER=<new-number> \
   FP_REGISTER_EXTENSION=0 ./macos/scripts/embed-into-app.sh \
   target/release/bundle/macos/Cloudreve.app
 ```
 
 - Increase `FP_BUILD_NUMBER` for every packaged macOS update, including test replacements. Do not reuse or decrease it for an upgrade build.
-- `embed-into-app.sh` stamps the same `CFBundleVersion` and `CFBundleShortVersionString` into the host app and embedded `.appex`, then re-signs the bundle. Keep those versions matched.
+- `embed-into-app.sh` stamps the same `CFBundleVersion` and `CFBundleShortVersionString` (short version defaults from `src-tauri/tauri.conf.json`) into the host app and embedded `.appex`, then re-signs the bundle. Keep those versions matched.
 - Use `FP_REGISTER_EXTENSION=0` when creating a package; register only when intentionally testing that exact local bundle.
 - Do not create a new File Provider domain identifier during an app upgrade or reset. Existing drives depend on the stable `cloudreve.drive.<drive UUID>` identifier for remote-event delivery.
 - If macOS retains stale registration after an ad-hoc replacement, use the app's **Reset Finder Integration** action; do not add automatic domain replacement or alter sync anchors/event processing as an upgrade workaround.

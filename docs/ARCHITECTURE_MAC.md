@@ -415,9 +415,7 @@ or pretend that an App Group is available to the current ad-hoc build.
 Validation includes:
 
 ```bash
-bash macos/scripts/test-state-database.sh
-bash macos/scripts/test-pin-requests.sh
-bash macos/scripts/test-file-provider-activity.sh
+bash macos/scripts/test-all.sh
 cargo test -p cloudreve-sync --lib fileprovider
 ```
 

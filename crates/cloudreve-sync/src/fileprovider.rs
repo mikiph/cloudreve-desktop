@@ -324,7 +324,7 @@ fn mark_download_retry(domain_id: &str, item_identifier: &str) -> Result<()> {
 /// long-lived SSE listener itself: XPC services get suspended when idle).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct FpEventRecord {
-    /// Unix epoch milliseconds when the app received the event.
+    /// Initially the receive time in ms; overwritten with the allocated journal sequence on append.
     pub ts: i64,
     #[serde(rename = "type")]
     pub event_type: String,

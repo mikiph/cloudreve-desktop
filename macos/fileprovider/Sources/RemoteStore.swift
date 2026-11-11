@@ -127,8 +127,8 @@ final class RemoteStore {
 
     /// Remote event recorded by the main app in the shared SQLite journal.
     struct FpEvent: Codable {
-        let ts: Int64  // unix epoch milliseconds
-        let type: String  // create | modify | metadata | rename | delete
+        let ts: Int64  // journal sequence (>= ms timestamp, strictly increasing)
+        let type: String  // create | modify | metadata | rename | delete | rescan | refresh_presented | presented_page | metadata_rescan | metadata_name
         let from: String  // path relative to drive root, or an absolute URI
         let to: String?
         let localEcho: Bool?
@@ -1540,7 +1540,7 @@ final class RemoteStore {
 
     // MARK: Anchors and change replay
 
-    /// Anchor for the last delivered event: "evt-<millis>".
+    /// Anchor for the last delivered event: "evt-<sequence>" (journal sequence, not a raw timestamp).
     func currentSyncAnchor() throws -> NSFileProviderSyncAnchor {
         let lastTs = try FileProviderStateDatabase().eventSnapshot(drive: drive.id, since: nil).latest
         return NSFileProviderSyncAnchor(Data("evt-\(lastTs)".utf8))
