@@ -62,7 +62,6 @@ jobs:
           FP_CONFIGURATION: Release
           FP_REGISTER_EXTENSION: '0'
           FP_BUILD_NUMBER: '${{ github.run_number }}'
-          FP_SHORT_VERSION: '0.2.1'
         run: |
           bash macos/scripts/embed-into-app.sh
           codesign --verify --deep --strict target/release/bundle/macos/Cloudreve.app

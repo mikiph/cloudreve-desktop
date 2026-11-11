@@ -5,6 +5,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP="$ROOT/target/release/bundle/macos/Cloudreve.app"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+EXPECTED_VERSION="$(plutil -extract version raw -o - "$ROOT/src-tauri/tauri.conf.json")"
+test "$VERSION" = "$EXPECTED_VERSION" || { echo "error: bundle version $VERSION does not match tauri.conf.json $EXPECTED_VERSION" >&2; exit 1; }
 BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")"
 EXT="$APP/Contents/PlugIns/CloudreveFileProvider.appex"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = cloudreve.desktop

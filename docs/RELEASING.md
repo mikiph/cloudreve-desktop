@@ -15,12 +15,15 @@ delete old domains, private state or downloaded content.
    ```sh
    cargo tauri build --bundles app
    FP_CONFIGURATION=Release FP_REGISTER_EXTENSION=0 \
-     FP_SHORT_VERSION=0.2.1 FP_BUILD_NUMBER=184 \
+     FP_BUILD_NUMBER=184 \
      bash macos/scripts/embed-into-app.sh
    TAURI_SIGNING_PRIVATE_KEY_PATH=/secure/path/updater.key \
      TAURI_SIGNING_PRIVATE_KEY_PASSWORD='' \
      bash macos/scripts/package-release.sh
    ```
+
+   The short version comes from `src-tauri/tauri.conf.json`; `FP_BUILD_NUMBER`
+   is required and must exceed the previous release.
 
 4. Verify the DMG, matching app/extension versions, signature, and updater archive
    contents. Test the package on macOS. Do not overwrite an installed app while
