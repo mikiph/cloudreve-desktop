@@ -212,6 +212,17 @@ impl AutoFixResult {
     }
 }
 
+/// Target name for an auto-fix of an item whose current name is `current_name`.
+/// A name that is already valid is kept (the issue is stale); otherwise the
+/// suggested replacement is used. `taken` must ignore the item's own path.
+pub fn auto_fix_target(current_name: &str, taken: &dyn Fn(&str) -> bool) -> String {
+    if validate_target_name(current_name).is_ok() {
+        current_name.to_string()
+    } else {
+        suggest_valid_name(current_name, taken)
+    }
+}
+
 pub enum RenameTarget {
     Name(String),
     /// Rename to `suggest_valid_name` of the item's current local name.
@@ -244,8 +255,9 @@ pub async fn rename_item_locally(
                 .ok_or_else(|| "Finder could not locate this item".to_string())?
                 .to_string();
             let parent = current.parent().map(|p| p.to_path_buf());
-            suggest_valid_name(&name, &|candidate| {
-                parent.as_ref().is_some_and(|p| p.join(candidate).exists())
+            auto_fix_target(&name, &|candidate| {
+                candidate != name
+                    && parent.as_ref().is_some_and(|p| p.join(candidate).exists())
             })
         }
     };
@@ -595,5 +607,13 @@ mod tests {
         assert_eq!(result.fixed, 1);
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].filename, "c?d");
+    }
+
+    #[test]
+    fn auto_fix_keeps_valid_names_and_renames_invalid_ones() {
+        let always_taken = |_: &str| true;
+        assert_eq!(auto_fix_target("fine (1).txt", &always_taken), "fine (1).txt");
+        assert_eq!(auto_fix_target("a?b.txt", &|_| false), "a_b.txt");
+        assert_eq!(auto_fix_target("a?b.txt", &|n| n == "a_b.txt"), "a_b (2).txt");
     }
 }
