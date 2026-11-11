@@ -648,6 +648,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             commands::resolve_file_provider_issue,
             #[cfg(target_os = "macos")]
+            commands::auto_fix_invalid_name_issues,
+            #[cfg(target_os = "macos")]
             commands::reveal_file_provider_issue,
             commands::get_drives_info,
             #[cfg(target_os = "macos")]

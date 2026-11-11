@@ -983,6 +983,7 @@ pub async fn resolve_file_provider_issue(
     state: State<'_, AppStateHandle>,
     issue_id: String,
     action: String,
+    new_name: Option<String>,
 ) -> CommandResult<()> {
     let (drives, issues) = file_provider_issues(&state).await?;
     let issue = issues
@@ -1009,8 +1010,44 @@ pub async fn resolve_file_provider_issue(
         .map_err(|error| error.to_string());
     }
 
+    let invalid_name =
+        issue.kind.as_deref() == Some(crate::file_provider_issue::INVALID_NAME_KIND);
+    if matches!(action.as_str(), "undo_rename" | "rename" | "auto_fix") {
+        if !invalid_name {
+            return Err("This action is not available for this Finder issue".to_string());
+        }
+        let target = match action.as_str() {
+            "rename" => {
+                crate::file_provider_issue::RenameTarget::Name(new_name.unwrap_or_default().trim().to_string())
+            }
+            "auto_fix" => crate::file_provider_issue::RenameTarget::AutoFix,
+            _ => {
+                let name = issue
+                    .previous_name
+                    .clone()
+                    .ok_or_else(|| "This item has no previous name to restore".to_string())?;
+                crate::file_provider_issue::RenameTarget::Name(name)
+            }
+        };
+        crate::file_provider_issue::rename_item_locally(
+            &domain_id,
+            &drive.name,
+            &issue.item_identifier,
+            target,
+        )
+        .await?;
+        return cloudreve_sync::fileprovider::signal_cannot_synchronize_resolved(
+            &domain_id,
+            &drive.name,
+        )
+        .await
+        .map_err(|error| error.to_string());
+    }
     if action != "retry" {
         return Err("Only retry is available for this Finder issue".to_string());
+    }
+    if invalid_name {
+        return Err("Rename the item instead".to_string());
     }
     match issue.operation.as_str() {
         "delete" => cloudreve_sync::fileprovider::retry_item_deletion(
@@ -1036,6 +1073,51 @@ pub async fn resolve_file_provider_issue(
         .map_err(|error| error.to_string()),
         _ => Err("Unknown Finder operation".to_string()),
     }
+}
+
+/// Applies the auto-fix to every current `invalid_name` issue (optionally one drive).
+/// Continues past failures and signals resolution once per drive at the end.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn auto_fix_invalid_name_issues(
+    state: State<'_, AppStateHandle>,
+    drive_id: Option<String>,
+) -> CommandResult<crate::file_provider_issue::AutoFixResult> {
+    let (drives, issues) = file_provider_issues(&state).await?;
+    let mut result = crate::file_provider_issue::AutoFixResult::default();
+    let mut touched = std::collections::BTreeSet::<String>::new();
+    for issue in crate::file_provider_issue::invalid_name_issues(&issues, drive_id.as_deref()) {
+        let Some(drive) = drives.iter().find(|drive| drive.id == issue.drive_id) else {
+            result.record(&issue.filename, Err("Drive is no longer available".to_string()));
+            continue;
+        };
+        let domain_id = cloudreve_sync::fileprovider::domain_identifier(&drive.id);
+        let outcome = crate::file_provider_issue::rename_item_locally(
+            &domain_id,
+            &drive.name,
+            &issue.item_identifier,
+            crate::file_provider_issue::RenameTarget::AutoFix,
+        )
+        .await;
+        if outcome.is_ok() {
+            touched.insert(drive.id.clone());
+        }
+        result.record(&issue.filename, outcome);
+    }
+    for id in touched {
+        if let Some(drive) = drives.iter().find(|drive| drive.id == id) {
+            let domain_id = cloudreve_sync::fileprovider::domain_identifier(&drive.id);
+            if let Err(error) = cloudreve_sync::fileprovider::signal_cannot_synchronize_resolved(
+                &domain_id,
+                &drive.name,
+            )
+            .await
+            {
+                tracing::warn!(target: "fileprovider", %error, "Could not signal after batch name fix");
+            }
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(target_os = "macos")]

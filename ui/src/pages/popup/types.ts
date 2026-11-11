@@ -69,7 +69,9 @@ export interface FileProviderIssue {
   is_folder: boolean;
   operation: "upload" | "download" | "delete";
   source: "pending" | "upload_conflict";
-  kind?: "locked" | "stale" | "unverified";
+  kind?: "locked" | "stale" | "unverified" | "invalid_name" | null;
+  previous_name?: string | null;
+  suggested_name?: string | null;
   application?: string;
   message: string;
   error_domain?: string;
@@ -82,4 +84,9 @@ export interface FileIconResponse {
   data: string; // Base64 encoded RGBA pixel data
   width: number;
   height: number;
+}
+
+export interface AutoFixResult {
+  fixed: number;
+  failed: { filename: string; error: string }[];
 }

@@ -23,7 +23,7 @@ import { type as platformType } from "@tauri-apps/plugin-os";
 import { useTranslation } from "react-i18next";
 import Settings from "../../common/icons/Settings";
 import CloudreveLogo from "../../common/CloudreveLogo";
-import type { FileProviderIssue, StatusSummary } from "./types";
+import type { AutoFixResult, FileProviderIssue, StatusSummary } from "./types";
 import DriveChips from "./DriveChips";
 import TaskItem from "./TaskItem";
 import TaskHistoryGroup from "./TaskHistoryGroup";
@@ -43,6 +43,11 @@ export default function Popup() {
   const [loading, setLoading] = useState(true);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [fixingNames, setFixingNames] = useState(false);
+  const [fixResult, setFixResult] = useState<{
+    severity: "success" | "warning" | "error";
+    text: string;
+  } | null>(null);
   const [view, setView] = useState<"recent" | "pinned" | "shared">("recent");
   const isFetchingRef = useRef(false);
   const suppressBlurCloseUntilRef = useRef(0);
@@ -198,6 +203,32 @@ export default function Popup() {
   const hasPendingConflicts =
     summary?.pending_conflicts && summary.pending_conflicts.length > 0;
   const hasFileProviderIssues = fileProviderIssues.length > 0;
+  const invalidNameCount = fileProviderIssues.filter(
+    (issue) => issue.kind === "invalid_name",
+  ).length;
+  const handleFixAllNames = async () => {
+    setFixingNames(true);
+    setFixResult(null);
+    try {
+      const result = await invoke<AutoFixResult>("auto_fix_invalid_name_issues", {
+        driveId: selectedDrive,
+      });
+      const failures = result.failed
+        .map((failure) => `${failure.filename}: ${failure.error}`)
+        .join("; ");
+      setFixResult({
+        severity: result.failed.length > 0 ? "warning" : "success",
+        text:
+          `Fixed ${result.fixed} name${result.fixed === 1 ? "" : "s"}.` +
+          (failures ? ` Failed: ${failures}` : ""),
+      });
+      await fetchSummary();
+    } catch (error) {
+      setFixResult({ severity: "error", text: String(error) });
+    } finally {
+      setFixingNames(false);
+    }
+  };
   const hasAnyConflicts = hasPendingConflicts || hasFileProviderIssues;
   const conflictCount =
     (summary?.pending_conflicts.length ?? 0) + fileProviderIssues.length;
@@ -319,6 +350,19 @@ export default function Popup() {
                   >
                     {t("popup.syncConflicts", "Sync conflicts")}
                   </Typography>
+                  {invalidNameCount >= 2 && (
+                    <Button
+                      size="small"
+                      variant="text"
+                      color="warning"
+                      disabled={fixingNames}
+                      onClick={handleFixAllNames}
+                    >
+                      {fixingNames
+                        ? t("popup.fixingNames", "Fixing…")
+                        : t("popup.fixAllNames", "Fix all names ({{count}})", { count: invalidNameCount })}
+                    </Button>
+                  )}
                   {hasPendingConflicts && (
                     <ButtonGroup size="small" variant="text" color="warning">
                       <Button onClick={() => handleResolveAll("keep_remote")}>
@@ -406,6 +450,15 @@ export default function Popup() {
         )}
       </Box>
 
+      {fixResult && (
+        <Alert
+          severity={fixResult.severity}
+          onClose={() => setFixResult(null)}
+          sx={{ mx: 2, mb: 1 }}
+        >
+          {fixResult.text}
+        </Alert>
+      )}
       {refreshError && <Alert severity="error" sx={{ mx: 2, mb: 1 }}>{refreshError}</Alert>}
 
       {/* Footer Status */}
