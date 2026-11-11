@@ -49,6 +49,16 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         pendingMonitor?.refresh()
     }
 
+    /// Test seam: wraps an existing store without reading drives.json or
+    /// starting recovery work. The system always uses `init(domain:)`.
+    init(domain: NSFileProviderDomain, store: RemoteStore?,
+         pendingMonitor: FileProviderPendingMonitor? = nil) {
+        self.domain = domain
+        self.store = store
+        self.pendingMonitor = pendingMonitor
+        super.init()
+    }
+
     func invalidate() {
         logger.notice("FileProviderExtension invalidated")
     }
