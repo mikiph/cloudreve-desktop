@@ -488,6 +488,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             return progress
         }
 
+        do {
+            try NameValidation.validate(itemTemplate.filename)
+        } catch {
+            completionHandler(nil, [], false, FileProviderEnumerator.mapError(error))
+            return progress
+        }
+
         Task {
             do {
                 let parentURI = store.uri(for: itemTemplate.parentItemIdentifier)
@@ -635,6 +642,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         guard !RemoteStore.isIgnored(filename: item.filename) else {
             completionHandler(item, [], false, nil)
             return progress
+        }
+
+        if changedFields.contains(.filename) {
+            do {
+                try NameValidation.validate(item.filename)
+            } catch {
+                completionHandler(nil, [], false, FileProviderEnumerator.mapError(error))
+                return progress
+            }
         }
 
         Task {
