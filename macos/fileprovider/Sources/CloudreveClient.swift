@@ -798,12 +798,14 @@ final class CloudreveClient {
     func cancelOwnedUploads(under uri: String) async throws {
         let db = try FileProviderStateDatabase()
         let records = try db.rows("SELECT key,payload FROM fp_records WHERE namespace=?",
-            ["fileprovider-upload-sessions"])
+            [UploadSessionRecord.namespace])
         let root = uri.hasSuffix("/") ? String(uri.dropLast()) : uri
         for record in records where record[0].hasPrefix(driveID + ":") {
-            let value = try JSONDecoder().decode([String: String].self, from: Data(record[1].utf8))
-            guard let path = value["uri"], let id = value["id"],
-                path == root || path.hasPrefix(root + "/") else { continue }
+            // Tolerates legacy and v1 rows; unreadable rows are skipped.
+            guard let value = UploadSessionRecord.decode(Data(record[1].utf8)) else { continue }
+            let path = value.uri
+            let id = value.id
+            guard path == root || path.hasPrefix(root + "/") else { continue }
             struct Body: Encodable { let id: String; let uri: String }
             do {
                 let current = try await fileInfo(uri: path)
@@ -894,6 +896,40 @@ final class CloudreveClient {
         let mtime = (attrs[.modificationDate] as? Date).map {
             Int64($0.timeIntervalSince1970)
         }
+        let previous = overwrite ? previousVersion : nil
+        let now = Int64(Date().timeIntervalSince1970)
+
+        await cleanupAbandonedUploads(now: now)
+
+        // Continue an interrupted session for the same, unchanged file.
+        if let tracker = try await resumableUploadTracker(
+            uri: uri, overwrite: overwrite, previous: previous, fileURL: fileURL,
+            size: size, mtime: mtime, now: now)
+        {
+            progress.totalUnitCount = size
+            var resumed = false
+            do {
+                try await runUpload(
+                    tracker: tracker, fileURL: fileURL, size: size, progress: progress,
+                    onProgress: onProgress, uri: uri)
+                resumed = true
+            } catch {
+                if tracker.sentThisRun == 0, Self.shouldRestartFresh(error, progress: progress) {
+                    // Ownership was proven when the record was picked: drop the
+                    // session and start one fresh session (no loop).
+                    try? await cancelUploadSession(sessionID: tracker.record.id, uri: uri)
+                    progress.completedUnitCount = 0
+                } else {
+                    await handleUploadFailure(error, tracker: tracker, progress: progress)
+                    throw error
+                }
+            }
+            if resumed {
+                try FileProviderStateDatabase().remove(UploadSessionRecord.namespace, tracker.key)
+                logger.info("resumed upload \(uri, privacy: .private(mask: .hash)) (\(size) bytes)")
+                return
+            }
+        }
 
         struct SessionRequest: Encodable {
             let uri: String
@@ -911,20 +947,9 @@ final class CloudreveClient {
                 last_modified: mtime,
                 entity_type: overwrite ? "version" : nil,
                 encryption_supported: [UploadEncryptor.supportedAlgorithm],
-                previous: overwrite ? previousVersion : nil))
+                previous: previous))
 
-        let sessionKey = driveID + ":" + credential.session_id
-        do {
-            try FileProviderStateDatabase().put("fileprovider-upload-sessions", sessionKey,
-                try JSONEncoder().encode(["id": credential.session_id, "uri": uri]))
-        } catch {
-            try? await cancelUploadSession(credential: credential, uri: uri)
-            throw error
-        }
         let chunkSize = max(credential.chunk_size ?? 0, 1)
-        progress.totalUnitCount = size
-        onProgress?(0, size)
-
         let firstURL = (credential.upload_urls?.first).flatMap { $0.isEmpty ? nil : $0 }
         let firstSameOrigin: Bool? = firstURL.map { raw in
             if raw.hasPrefix("/") { return true }
@@ -935,6 +960,30 @@ final class CloudreveClient {
             uploadURLCount: firstURL == nil ? 0 : (credential.upload_urls?.count ?? 0),
             firstURLIsSameOrigin: firstSameOrigin,
             hasSlaveCredential: !(credential.credential ?? "").isEmpty)
+
+        let tracker: UploadRecordTracker
+        do {
+            let fingerprint = try UploadSessionRecord.fingerprint(
+                of: fileURL, size: size, chunkSize: chunkSize)
+            let record = UploadSessionRecord(
+                v: 1, id: credential.session_id, uri: uri, overwrite: overwrite,
+                previous: previous, size: size, mtime: mtime, headHash: fingerprint.head,
+                tailHash: fingerprint.tail, chunkSize: chunkSize, nextChunk: 0, etags: [],
+                kind: kind.recordValue, uploadURLs: credential.upload_urls ?? [],
+                credential: credential.credential, completeURL: credential.completeURL,
+                callbackSecret: credential.callback_secret, mimeType: credential.mime_type,
+                uploadPolicy: credential.upload_policy, encrypt: credential.encrypt_metadata,
+                expiresAt: credential.expires, createdAt: now, updatedAt: now)
+            tracker = UploadRecordTracker(
+                record: record,
+                key: UploadSessionRecord.key(driveID: driveID, sessionID: credential.session_id))
+            try tracker.write()
+        } catch {
+            try? await cancelUploadSession(credential: credential, uri: uri)
+            throw error
+        }
+        progress.totalUnitCount = size
+        onProgress?(0, size)
 
         // OneDrive cannot take empty uploads: create the empty item directly.
         if kind == .oneDrive && size == 0 {
@@ -948,57 +997,209 @@ final class CloudreveClient {
         }
 
         do {
-            let encryptor = try credential.encrypt_metadata.map(UploadEncryptor.init(metadata:))
-            switch kind {
-            case .unsupported(let type):
-                throw CloudreveError.unsupportedStoragePolicy(type)
-            case .cloudreve, .slave:
-                try await forEachChunk(
-                    of: fileURL, size: size, chunkSize: chunkSize, encryptor: encryptor,
-                    progress: progress, onProgress: onProgress
-                ) { index, _, data in
-                    try await self.uploadChunk(
-                        credential: credential, kind: kind, index: index, data: data)
-                }
-            case .s3Like(let type):
-                try await uploadS3Like(
-                    type: type, credential: credential, fileURL: fileURL, size: size,
-                    chunkSize: chunkSize, encryptor: encryptor, progress: progress,
-                    onProgress: onProgress, uri: uri)
-            case .oneDrive:
-                try await uploadOneDrive(
-                    credential: credential, fileURL: fileURL, size: size, chunkSize: chunkSize,
-                    encryptor: encryptor, progress: progress, onProgress: onProgress)
-            case .qiniu:
-                try await uploadQiniu(
-                    credential: credential, fileURL: fileURL, size: size, chunkSize: chunkSize,
-                    encryptor: encryptor, progress: progress, onProgress: onProgress, uri: uri)
-            case .upyun:
-                try await uploadUpyun(
-                    credential: credential, fileURL: fileURL, size: size, chunkSize: chunkSize,
-                    encryptor: encryptor, progress: progress, onProgress: onProgress, uri: uri)
-            }
+            try await runUpload(
+                tracker: tracker, fileURL: fileURL, size: size, progress: progress,
+                onProgress: onProgress, uri: uri)
         } catch {
-            // Cancel this client's session after a failed upload.
-            try? await cancelUploadSession(credential: credential, uri: uri)
+            await handleUploadFailure(error, tracker: tracker, progress: progress)
             throw error
         }
-        try FileProviderStateDatabase().remove("fileprovider-upload-sessions", sessionKey)
+        try FileProviderStateDatabase().remove(UploadSessionRecord.namespace, tracker.key)
         logger.info("uploaded \(uri, privacy: .private(mask: .hash)) (\(size) bytes, chunks ok)")
     }
 
+    /// Number of upload record writes, for tests that bound the flush volume.
+    static var recordWritesForTests = 0
+
+    /// Credential rebuilt from the persisted record (never logged).
+    private static func credential(from record: UploadSessionRecord) -> UploadCredentialPayload {
+        let policyType: String?
+        switch UploadTargetKind(recordValue: record.kind) ?? .cloudreve {
+        case .cloudreve: policyType = nil
+        case .slave: policyType = "remote"
+        case .s3Like(let type): policyType = type
+        case .oneDrive: policyType = "onedrive"
+        case .qiniu: policyType = "qiniu"
+        case .upyun: policyType = "upyun"
+        case .unsupported(let type): policyType = type
+        }
+        return UploadCredentialPayload(
+            session_id: record.id, chunk_size: record.chunkSize,
+            upload_urls: record.uploadURLs.isEmpty ? nil : record.uploadURLs,
+            encrypt_metadata: record.encrypt, credential: record.credential,
+            storage_policy: UploadStoragePolicy(type: policyType, relay: nil),
+            callback_secret: record.callbackSecret, completeURL: record.completeURL,
+            upload_policy: record.uploadPolicy, mime_type: record.mimeType,
+            expires: record.expiresAt)
+    }
+
+    /// Sends the remaining chunks (from `tracker.record.nextChunk`) and completes the upload.
+    private func runUpload(
+        tracker: UploadRecordTracker, fileURL: URL, size: Int64, progress: Progress,
+        onProgress: ((Int64, Int64) -> Void)?, uri: String
+    ) async throws {
+        let record = tracker.record
+        let kind = UploadTargetKind(recordValue: record.kind) ?? .unsupported(record.kind)
+        let credential = Self.credential(from: record)
+        let chunkSize = record.chunkSize
+        let encryptor = try record.encrypt.map(UploadEncryptor.init(metadata:))
+        switch kind {
+        case .unsupported(let type):
+            throw CloudreveError.unsupportedStoragePolicy(type)
+        case .cloudreve, .slave:
+            try await forEachChunk(
+                of: fileURL, size: size, chunkSize: chunkSize, encryptor: encryptor,
+                tracker: tracker, progress: progress, onProgress: onProgress
+            ) { index, _, data in
+                try await self.uploadChunk(
+                    credential: credential, kind: kind, index: index, data: data)
+            }
+        case .s3Like(let type):
+            try await uploadS3Like(
+                type: type, credential: credential, fileURL: fileURL, size: size,
+                chunkSize: chunkSize, encryptor: encryptor, tracker: tracker, progress: progress,
+                onProgress: onProgress, uri: uri)
+        case .oneDrive:
+            try await uploadOneDrive(
+                credential: credential, fileURL: fileURL, size: size, chunkSize: chunkSize,
+                encryptor: encryptor, tracker: tracker, progress: progress, onProgress: onProgress)
+        case .qiniu:
+            try await uploadQiniu(
+                credential: credential, fileURL: fileURL, size: size, chunkSize: chunkSize,
+                encryptor: encryptor, tracker: tracker, progress: progress,
+                onProgress: onProgress, uri: uri)
+        case .upyun:
+            try await uploadUpyun(
+                credential: credential, fileURL: fileURL, size: size, chunkSize: chunkSize,
+                encryptor: encryptor, tracker: tracker, progress: progress,
+                onProgress: onProgress, uri: uri)
+        }
+    }
+
+    private static func classifyUploadFailure(_ error: Error) -> ReplayFailure {
+        // A malformed key can never succeed on retry.
+        if error is UploadEncryptionError { return .permanent }
+        return ReplayFailure.classify(error)
+    }
+
+    private static func shouldRestartFresh(_ error: Error, progress: Progress) -> Bool {
+        if progress.isCancelled { return false }
+        if case CloudreveError.lockConflict = error { return false }
+        return classifyUploadFailure(error) == .permanent
+    }
+
+    /// Keeps or cancels the session after a failed upload (never force-unlocks).
+    /// Evaluated top to bottom: 40073 and user cancel before the classifier.
+    private func handleUploadFailure(
+        _ error: Error, tracker: UploadRecordTracker, progress: Progress
+    ) async {
+        if case CloudreveError.lockConflict = error {
+            tracker.flush()  // another application holds a lock: keep, never cancel
+            return
+        }
+        if progress.isCancelled {
+            try? await cancelUploadSession(sessionID: tracker.record.id, uri: tracker.record.uri)
+            return
+        }
+        switch Self.classifyUploadFailure(error) {
+        case .transient, .authentication, .cancelled:
+            tracker.flush()  // keep the server session; the next attempt continues
+        case .permanent:
+            try? await cancelUploadSession(sessionID: tracker.record.id, uri: tracker.record.uri)
+        }
+    }
+
+    /// Cancels `record`'s session only with ownership proof, then drops the record.
+    /// Without proof (the item reports a different or no session) only the record is deleted.
+    /// A network failure keeps the record for a later attempt.
+    private func discardUploadRecord(key: String, record: UploadSessionRecord) async {
+        do {
+            let current = try await fileInfo(uri: record.uri)
+            if current.metadata?["sys:upload_session_id"] == record.id {
+                try await cancelUploadSession(sessionID: record.id, uri: record.uri)
+            }
+        } catch CloudreveError.noSuchItem {
+        } catch {
+            return
+        }
+        try? FileProviderStateDatabase().remove(UploadSessionRecord.namespace, key)
+    }
+
+    private func driveUploadRecords() -> [(key: String, record: UploadSessionRecord)] {
+        guard let db = try? FileProviderStateDatabase(),
+            let rows = try? db.rows(
+                "SELECT key,payload FROM fp_records WHERE namespace=?",
+                [UploadSessionRecord.namespace])
+        else { return [] }
+        return rows.compactMap { row in
+            guard row[0].hasPrefix(driveID + ":"),
+                let record = UploadSessionRecord.decode(Data(row[1].utf8)) else { return nil }
+            return (row[0], record)
+        }
+    }
+
+    /// Examines at most 10 (oldest first) records of this drive and discards abandoned ones.
+    private func cleanupAbandonedUploads(now: Int64) async {
+        let oldest = driveUploadRecords().sorted { $0.record.updatedAt < $1.record.updatedAt }.prefix(10)
+        for entry in oldest where entry.record.isAbandoned(now: now) {
+            await discardUploadRecord(key: entry.key, record: entry.record)
+        }
+    }
+
+    /// Picks the record that continues this exact upload and proves ownership of its session.
+    /// Other records for the same URI (changed file, expired, not resumable) are discarded.
+    private func resumableUploadTracker(
+        uri: String, overwrite: Bool, previous: String?, fileURL: URL, size: Int64,
+        mtime: Int64?, now: Int64
+    ) async throws -> UploadRecordTracker? {
+        var chosen: (key: String, record: UploadSessionRecord)?
+        for entry in driveUploadRecords() where entry.record.uri == uri {
+            let record = entry.record
+            if chosen == nil, record.isResumable(now: now), record.size == size,
+                record.mtime == mtime, record.overwrite == overwrite, record.previous == previous,
+                let fingerprint = try? UploadSessionRecord.fingerprint(
+                    of: fileURL, size: size, chunkSize: record.chunkSize),
+                record.matches(
+                    uri: uri, overwrite: overwrite, previous: previous, size: size, mtime: mtime,
+                    head: fingerprint.head, tail: fingerprint.tail, chunkSize: record.chunkSize)
+            {
+                chosen = entry
+                continue
+            }
+            await discardUploadRecord(key: entry.key, record: record)
+        }
+        guard let chosen else { return nil }
+        do {
+            let current = try await fileInfo(uri: uri)
+            guard current.metadata?["sys:upload_session_id"] == chosen.record.id else {
+                try? FileProviderStateDatabase().remove(UploadSessionRecord.namespace, chosen.key)
+                return nil
+            }
+        } catch CloudreveError.noSuchItem {
+            try? FileProviderStateDatabase().remove(UploadSessionRecord.namespace, chosen.key)
+            return nil
+        }
+        return UploadRecordTracker(record: chosen.record, key: chosen.key)
+    }
+
     /// Reads, encrypts and hands each chunk to `body`; reports plaintext progress.
+    /// Starts at the tracker's `nextChunk` and acknowledges every finished chunk.
     /// A zero-byte file yields exactly one empty chunk at index 0.
     private func forEachChunk(
         of fileURL: URL, size: Int64, chunkSize: Int64, encryptor: UploadEncryptor?,
-        progress: Progress, onProgress: ((Int64, Int64) -> Void)?,
+        tracker: UploadRecordTracker, progress: Progress, onProgress: ((Int64, Int64) -> Void)?,
         _ body: (_ index: Int, _ offset: Int64, _ data: Data) async throws -> Void
     ) async throws {
         let handle = try FileHandle(forReadingFrom: fileURL)
         defer { try? handle.close() }
 
-        var index = 0
-        var byteOffset: UInt64 = 0
+        var index = tracker.record.nextChunk
+        var byteOffset = UInt64(index) * UInt64(chunkSize)
+        if index > 0 {
+            try handle.seek(toOffset: byteOffset)
+            progress.completedUnitCount = min(Int64(byteOffset), size)
+            onProgress?(progress.completedUnitCount, size)
+        }
         while true {
             if progress.isCancelled { throw CocoaError(.userCancelled) }
             let data = try handle.read(upToCount: Int(chunkSize)) ?? Data()
@@ -1008,9 +1209,11 @@ final class CloudreveClient {
             progress.completedUnitCount += Int64(data.count)
             onProgress?(progress.completedUnitCount, size)
             byteOffset += UInt64(data.count)
+            tracker.chunkAcknowledged(index)
             index += 1
             if data.isEmpty { break }  // zero-byte file: single empty chunk
         }
+        tracker.flush()  // always persist before completion
     }
 
     // MARK: Direct provider uploads (no account token ever leaves the instance origin)
@@ -1038,17 +1241,16 @@ final class CloudreveClient {
 
     private func uploadS3Like(
         type: String, credential: UploadCredentialPayload, fileURL: URL, size: Int64,
-        chunkSize: Int64, encryptor: UploadEncryptor?, progress: Progress,
-        onProgress: ((Int64, Int64) -> Void)?, uri: String
+        chunkSize: Int64, encryptor: UploadEncryptor?, tracker: UploadRecordTracker,
+        progress: Progress, onProgress: ((Int64, Int64) -> Void)?, uri: String
     ) async throws {
         let urls = credential.upload_urls ?? []
         guard urls.count >= ObjectStorageUpload.chunkCount(size: size, chunkSize: chunkSize) else {
             throw CloudreveError.badResponse("storage policy returned too few upload URLs")
         }
-        var etags: [String] = []
         try await forEachChunk(
             of: fileURL, size: size, chunkSize: chunkSize, encryptor: encryptor,
-            progress: progress, onProgress: onProgress
+            tracker: tracker, progress: progress, onProgress: onProgress
         ) { index, _, data in
             var request = URLRequest(url: try self.providerURL(urls[index]))
             request.httpMethod = "PUT"
@@ -1057,7 +1259,7 @@ final class CloudreveClient {
             let (_, http) = try await self.providerSend(request)
             guard let etag = ObjectStorageUpload.trimmedETag(http.value(forHTTPHeaderField: "ETag"))
             else { throw CloudreveError.badResponse("missing ETag") }
-            etags.append(etag)
+            tracker.record.etags.append(etag)
         }
 
         guard let complete = credential.completeURL, !complete.isEmpty,
@@ -1070,7 +1272,7 @@ final class CloudreveClient {
             request.setValue("true", forHTTPHeaderField: "x-oss-forbid-overwrite")
             request.setValue("yes", forHTTPHeaderField: "x-oss-complete-all")
         } else {
-            request.httpBody = ObjectStorageUpload.completeMultipartXML(etags: etags)
+            request.httpBody = ObjectStorageUpload.completeMultipartXML(etags: tracker.record.etags)
             if type == "cos" { request.setValue("true", forHTTPHeaderField: "x-cos-forbid-overwrite") }
         }
         _ = try await providerSend(request)
@@ -1091,7 +1293,8 @@ final class CloudreveClient {
 
     private func uploadOneDrive(
         credential: UploadCredentialPayload, fileURL: URL, size: Int64, chunkSize: Int64,
-        encryptor: UploadEncryptor?, progress: Progress, onProgress: ((Int64, Int64) -> Void)?
+        encryptor: UploadEncryptor?, tracker: UploadRecordTracker, progress: Progress,
+        onProgress: ((Int64, Int64) -> Void)?
     ) async throws {
         guard let raw = credential.upload_urls?.first else {
             throw CloudreveError.badResponse("missing upload URL")
@@ -1099,7 +1302,7 @@ final class CloudreveClient {
         let url = try providerURL(raw)
         try await forEachChunk(
             of: fileURL, size: size, chunkSize: chunkSize, encryptor: encryptor,
-            progress: progress, onProgress: onProgress
+            tracker: tracker, progress: progress, onProgress: onProgress
         ) { _, offset, data in
             var request = URLRequest(url: url)
             request.httpMethod = "PUT"
@@ -1123,17 +1326,16 @@ final class CloudreveClient {
 
     private func uploadQiniu(
         credential: UploadCredentialPayload, fileURL: URL, size: Int64, chunkSize: Int64,
-        encryptor: UploadEncryptor?, progress: Progress, onProgress: ((Int64, Int64) -> Void)?,
-        uri: String
+        encryptor: UploadEncryptor?, tracker: UploadRecordTracker, progress: Progress,
+        onProgress: ((Int64, Int64) -> Void)?, uri: String
     ) async throws {
         guard let base = credential.upload_urls?.first, let token = credential.credential,
             !token.isEmpty
         else { throw CloudreveError.badResponse("missing upload URL or credential") }
         struct PartResponse: Decodable { let etag: String }
-        var etags: [String] = []
         try await forEachChunk(
             of: fileURL, size: size, chunkSize: chunkSize, encryptor: encryptor,
-            progress: progress, onProgress: onProgress
+            tracker: tracker, progress: progress, onProgress: onProgress
         ) { index, _, data in
             guard let url = ObjectStorageUpload.qiniuPartURL(base: base, index: index) else {
                 throw CloudreveError.badResponse("invalid upload URL")
@@ -1147,22 +1349,22 @@ final class CloudreveClient {
             guard let part = try? JSONDecoder().decode(PartResponse.self, from: body) else {
                 throw CloudreveError.badResponse("missing ETag")
             }
-            etags.append(part.etag)
+            tracker.record.etags.append(part.etag)
         }
         var request = URLRequest(url: try providerURL(base))
         request.httpMethod = "POST"
         request.setValue("UpToken \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = ObjectStorageUpload.qiniuCompleteBody(
-            etags: etags, mimeType: credential.mime_type)
+            etags: tracker.record.etags, mimeType: credential.mime_type)
         _ = try await providerSend(request)
         await waitForServerCompletion(credential: credential, uri: uri)
     }
 
     private func uploadUpyun(
         credential: UploadCredentialPayload, fileURL: URL, size: Int64, chunkSize: Int64,
-        encryptor: UploadEncryptor?, progress: Progress, onProgress: ((Int64, Int64) -> Void)?,
-        uri: String
+        encryptor: UploadEncryptor?, tracker: UploadRecordTracker, progress: Progress,
+        onProgress: ((Int64, Int64) -> Void)?, uri: String
     ) async throws {
         guard ObjectStorageUpload.chunkCount(size: size, chunkSize: chunkSize) == 1 else {
             throw CloudreveError.unsupportedStoragePolicy("upyun (file larger than one chunk)")
@@ -1173,7 +1375,7 @@ final class CloudreveClient {
         let url = try providerURL(raw)
         try await forEachChunk(
             of: fileURL, size: size, chunkSize: chunkSize, encryptor: encryptor,
-            progress: progress, onProgress: onProgress
+            tracker: tracker, progress: progress, onProgress: onProgress
         ) { _, _, data in
             let boundary = "cloudreve-\(UUID().uuidString)"
             var request = URLRequest(url: url)
@@ -1207,15 +1409,21 @@ final class CloudreveClient {
     private func cancelUploadSession(credential: UploadCredentialPayload, uri: String)
         async throws
     {
+        try await cancelUploadSession(sessionID: credential.session_id, uri: uri)
+    }
+
+    /// Cancels a session created by this client and drops its record.
+    /// Callers must have created the session or proven ownership.
+    private func cancelUploadSession(sessionID: String, uri: String) async throws {
         struct Body: Encodable {
             let id: String
             let uri: String
         }
         try await callVoid(
             "DELETE", "/file/upload",
-            body: Body(id: credential.session_id, uri: wireCloudreveURI(uri)))
-        try FileProviderStateDatabase().remove("fileprovider-upload-sessions",
-            driveID + ":" + credential.session_id)
+            body: Body(id: sessionID, uri: wireCloudreveURI(uri)))
+        try FileProviderStateDatabase().remove(
+            UploadSessionRecord.namespace, UploadSessionRecord.key(driveID: driveID, sessionID: sessionID))
     }
 
     private func uploadChunk(
@@ -1401,5 +1609,43 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
             continuation?.resume(throwing: CloudreveError.badResponse("download incomplete"))
         }
         continuation = nil
+    }
+}
+
+/// Tracks acknowledged chunks of one upload session and flushes the record
+/// when >= 8 chunks or >= 5 s have passed since the last write.
+final class UploadRecordTracker {
+    var record: UploadSessionRecord
+    let key: String
+    /// Chunks acknowledged by this attempt (not counting restored ones).
+    private(set) var sentThisRun = 0
+    private var unflushed = 0
+    private var lastWrite = Date()
+
+    init(record: UploadSessionRecord, key: String) {
+        self.record = record
+        self.key = key
+    }
+
+    func write() throws {
+        record.updatedAt = Int64(Date().timeIntervalSince1970)
+        try FileProviderStateDatabase().put(
+            UploadSessionRecord.namespace, key, try JSONEncoder().encode(record))
+        CloudreveClient.recordWritesForTests += 1
+        unflushed = 0
+        lastWrite = Date()
+    }
+
+    func chunkAcknowledged(_ index: Int) {
+        record.nextChunk = index + 1
+        sentThisRun += 1
+        unflushed += 1
+        if unflushed >= 8 || Date().timeIntervalSince(lastWrite) >= 5 { flush() }
+    }
+
+    /// Best effort: losing a flush only costs re-sending a few chunks.
+    func flush() {
+        guard unflushed > 0 else { return }
+        try? write()
     }
 }

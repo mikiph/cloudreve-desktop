@@ -22,7 +22,7 @@ enum UploadEncryptionError: LocalizedError {
 }
 
 /// Cloudreve's per-file encryption parameters returned with an upload session.
-struct UploadEncryptMetadata: Decodable {
+struct UploadEncryptMetadata: Codable {
     let algorithm: String
     let keyPlainText: String
     let iv: String
@@ -41,6 +41,13 @@ struct UploadEncryptMetadata: Decodable {
             ?? container.decode(String.self, forKey: .cipher)
         keyPlainText = try container.decode(String.self, forKey: .keyPlainText)
         iv = try container.decode(String.self, forKey: .iv)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(algorithm, forKey: .algorithm)
+        try container.encode(keyPlainText, forKey: .keyPlainText)
+        try container.encode(iv, forKey: .iv)
     }
 }
 

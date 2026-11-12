@@ -339,7 +339,7 @@ private final class StorageProtocol: URLProtocol {
         } catch CloudreveError.http(let status) {
             precondition(status == 500)
         } catch { preconditionFailure("expected http 500, got \(error)") }
-        precondition(hasCancel())
+        precondition(!hasCancel())  // 5xx is transient: the session is kept for resume
         precondition(calls("POST", host: "bucket.s3.invalid").isEmpty)
         everyCall += StorageProtocol.calls
 
