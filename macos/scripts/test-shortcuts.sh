@@ -20,6 +20,7 @@ swiftc -swift-version 5 \
     "$ROOT/macos/fileprovider/Sources/ObjectStorageUpload.swift" \
     "$ROOT/macos/fileprovider/Sources/ReplayErrorPolicy.swift" \
     "$ROOT/macos/fileprovider/Sources/UploadSessionRecord.swift" \
+    "$ROOT/macos/fileprovider/Sources/PartialDownloadStore.swift" \
     "$ROOT/macos/fileprovider/Tests/ShortcutTests.swift"
 
 "$TEST_BINARY"

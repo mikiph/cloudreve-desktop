@@ -1497,8 +1497,15 @@ final class CloudreveClient {
         to dest: URL,
         itemSize: Int64,
         progress: Progress,
-        onProgress: ((Int64, Int64) -> Void)? = nil
+        onProgress: ((Int64, Int64) -> Void)? = nil,
+        resume: (driveID: String, itemIdentifier: String, contentVersion: Data)? = nil
     ) async throws {
+        if let resume, itemSize >= Self.resumableDownloadThreshold {
+            try await resumableDownload(
+                sourceURL, to: dest, itemSize: itemSize, progress: progress,
+                onProgress: onProgress, resume: resume)
+            return
+        }
         let delegate = DownloadDelegate(
             dest: dest,
             progress: progress,
@@ -1510,6 +1517,51 @@ final class CloudreveClient {
             try await withCheckedThrowingContinuation { continuation in
                 delegate.continuation = continuation
                 let task = session.downloadTask(with: sourceURL)
+                progress.cancellationHandler = { task.cancel() }
+                task.resume()
+            }
+        } onCancel: {
+            progress.cancel()
+        }
+    }
+
+    /// Files smaller than this always download in one piece, with no partial files.
+    static let resumableDownloadThreshold: Int64 = 8 << 20
+
+    /// Streams into a partial file and continues with `Range` after an interruption.
+    private func resumableDownload(
+        _ sourceURL: URL,
+        to dest: URL,
+        itemSize: Int64,
+        progress: Progress,
+        onProgress: ((Int64, Int64) -> Void)?,
+        resume: (driveID: String, itemIdentifier: String, contentVersion: Data)
+    ) async throws {
+        var request = URLRequest(url: sourceURL)
+        var startOffset: Int64 = 0
+        if let partial = PartialDownloadStore.load(
+            driveID: resume.driveID, itemIdentifier: resume.itemIdentifier),
+            partial.contentVersion == resume.contentVersion, partial.size == itemSize,
+            partial.written > 0, partial.written < itemSize, !partial.encoded
+        {
+            startOffset = partial.written
+            request.setValue("bytes=\(startOffset)-", forHTTPHeaderField: "Range")
+            progress.completedUnitCount = startOffset
+        }
+        let delegate = ResumableDownloadDelegate(
+            dest: dest, driveID: resume.driveID, itemIdentifier: resume.itemIdentifier,
+            contentVersion: resume.contentVersion, expectedSize: itemSize,
+            requestedFrom: startOffset, progress: progress, onProgress: onProgress)
+        let configuration = (downloadConfiguration.copy() as? URLSessionConfiguration)
+            ?? downloadConfiguration
+        configuration.urlCache = nil  // never cache multi-GB bodies
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                delegate.continuation = continuation
+                let task = session.dataTask(with: request)
                 progress.cancellationHandler = { task.cancel() }
                 task.resume()
             }
@@ -1647,5 +1699,176 @@ final class UploadRecordTracker {
     func flush() {
         guard unflushed > 0 else { return }
         try? write()
+    }
+}
+
+/// Streams a large download into `PartialDownloadStore`, continuing from the
+/// last byte written when a usable partial exists. Used only for files that
+/// are at least `CloudreveClient.resumableDownloadThreshold` bytes.
+private final class ResumableDownloadDelegate: NSObject, URLSessionDataDelegate {
+    private static let sidecarInterval: Int64 = 4 << 20
+
+    let dest: URL
+    let driveID: String
+    let itemIdentifier: String
+    let contentVersion: Data
+    let expectedSize: Int64
+    /// Offset requested with `Range` (0 when downloading from the start).
+    let requestedFrom: Int64
+    let progress: Progress
+    let onProgress: ((Int64, Int64) -> Void)?
+    var continuation: CheckedContinuation<Void, Error>?
+
+    private var handle: FileHandle?
+    private var began = false
+    private var encoded = false
+    private var written: Int64 = 0
+    private var lastSaved: Int64 = 0
+    private var failure: Error?
+
+    init(
+        dest: URL, driveID: String, itemIdentifier: String, contentVersion: Data,
+        expectedSize: Int64, requestedFrom: Int64, progress: Progress,
+        onProgress: ((Int64, Int64) -> Void)?
+    ) {
+        self.dest = dest
+        self.driveID = driveID
+        self.itemIdentifier = itemIdentifier
+        self.contentVersion = contentVersion
+        self.expectedSize = expectedSize
+        self.requestedFrom = requestedFrom
+        self.progress = progress
+        self.onProgress = onProgress
+    }
+
+    private var state: PartialDownloadStore.State {
+        PartialDownloadStore.State(
+            written: written, contentVersion: contentVersion, size: expectedSize, encoded: encoded)
+    }
+
+    private func saveSidecar() {
+        PartialDownloadStore.save(driveID: driveID, itemIdentifier: itemIdentifier, state)
+        lastSaved = written
+    }
+
+    /// Starts (or continues) the part file once the response is accepted.
+    private func begin(resumeAt offset: Int64) throws {
+        let paths = PartialDownloadStore.paths(driveID: driveID, itemIdentifier: itemIdentifier)
+        let manager = FileManager.default
+        try manager.createDirectory(
+            at: paths.part.deletingLastPathComponent(), withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        if offset == 0 {
+            PartialDownloadStore.evict()
+            manager.createFile(atPath: paths.part.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
+        let handle = try FileHandle(forWritingTo: paths.part)
+        if offset > 0 {
+            try handle.truncate(atOffset: UInt64(offset))
+            try handle.seek(toOffset: UInt64(offset))
+        }
+        self.handle = handle
+        written = offset
+        began = true
+        saveSidecar()
+    }
+
+    private func contentRangeStart(_ http: HTTPURLResponse) -> (start: Int64, total: Int64?)? {
+        guard let header = http.value(forHTTPHeaderField: "Content-Range")?
+            .trimmingCharacters(in: .whitespaces), header.lowercased().hasPrefix("bytes ")
+        else { return nil }
+        let spec = header.dropFirst(6)
+        let parts = spec.split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2, let first = parts[0].split(separator: "-").first,
+            let start = Int64(first) else { return nil }
+        return (start, Int64(parts[1]))
+    }
+
+    func urlSession(
+        _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        func reject(_ error: Error) {
+            failure = error
+            completionHandler(.cancel)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            reject(CloudreveError.badResponse("not an HTTP response"))
+            return
+        }
+        let encoding = http.value(forHTTPHeaderField: "Content-Encoding")?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        encoded = encoding.map { !$0.isEmpty && $0 != "identity" } ?? false
+        do {
+            switch http.statusCode {
+            case 206 where requestedFrom > 0:
+                guard !encoded, let range = contentRangeStart(http), range.start == requestedFrom,
+                    range.total == nil || range.total == expectedSize
+                else {
+                    reject(CloudreveError.badResponse("unexpected content range"))
+                    return
+                }
+                try begin(resumeAt: requestedFrom)
+            case 200:
+                // The server ignored Range (or none was sent): write from the start.
+                try begin(resumeAt: 0)
+            default:
+                reject(CloudreveError.http(status: http.statusCode))
+                return
+            }
+        } catch {
+            reject(error)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard let handle else { return }
+        do {
+            try handle.write(contentsOf: data)
+        } catch {
+            failure = error
+            dataTask.cancel()
+            return
+        }
+        written += Int64(data.count)
+        progress.totalUnitCount = expectedSize
+        progress.completedUnitCount = written
+        onProgress?(written, expectedSize)
+        if written - lastSaved >= Self.sidecarInterval { saveSidecar() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        try? handle?.close()
+        handle = nil
+        defer { continuation = nil }
+        if let error = failure ?? error {
+            // Transient failures (network, 5xx), auth and cancellation keep the partial.
+            if ReplayFailure.classify(error) == .permanent {
+                PartialDownloadStore.remove(driveID: driveID, itemIdentifier: itemIdentifier)
+            } else if began {
+                saveSidecar()
+            }
+            continuation?.resume(throwing: error)
+            return
+        }
+        let paths = PartialDownloadStore.paths(driveID: driveID, itemIdentifier: itemIdentifier)
+        guard began, PartialDownloadStore.fileSize(paths.part) == expectedSize else {
+            PartialDownloadStore.remove(driveID: driveID, itemIdentifier: itemIdentifier)
+            continuation?.resume(throwing: CloudreveError.badResponse("download size mismatch"))
+            return
+        }
+        do {
+            let manager = FileManager.default
+            try manager.createDirectory(
+                at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if manager.fileExists(atPath: dest.path) { try manager.removeItem(at: dest) }
+            try manager.moveItem(at: paths.part, to: dest)
+            try? manager.removeItem(at: paths.meta)
+            continuation?.resume()
+        } catch {
+            continuation?.resume(throwing: error)
+        }
     }
 }
