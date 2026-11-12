@@ -869,6 +869,8 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
+        let status = response.status().as_u16();
+
         if content_type.contains("text/event-stream") {
             // Successfully upgraded to SSE
             Ok(FileEventSubscription::new(response))
@@ -885,6 +887,7 @@ impl Client {
                     return Err(crate::error::ApiError::SseNotUpgraded {
                         code: api_response.code,
                         message: api_response.msg,
+                        status: Some(status),
                     });
                 }
             }
@@ -893,6 +896,7 @@ impl Client {
             Err(crate::error::ApiError::SseNotUpgraded {
                 code: -1,
                 message: format!("Unexpected response: {}", response_text),
+                status: Some(status),
             })
         }
     }

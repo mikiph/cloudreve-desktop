@@ -7,6 +7,7 @@ pub(crate) mod fileprovider_audit;
 pub mod ignore;
 pub mod manager;
 pub mod mounts;
+pub mod push_health;
 #[cfg(windows)]
 pub mod placeholder;
 #[cfg(not(windows))]

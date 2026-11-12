@@ -65,6 +65,16 @@ fn should_retry_batch(attempt: u32) -> bool {
     attempt < EVENT_BATCH_COMMIT_ATTEMPTS
 }
 
+/// Delay after a listener error. Only a stream that stayed up long enough
+/// starts a fresh retry sequence; a subscribe that dies quickly keeps backing off.
+fn error_delay(backoff: &mut BackoffState, was_connected: bool, connected_for: Duration) -> Duration {
+    if was_connected {
+        reconnect_delay(backoff, connected_for)
+    } else {
+        backoff.next_delay()
+    }
+}
+
 struct BackoffState {
     retry_count: u32,
     current_delay: Duration,
@@ -124,13 +134,7 @@ impl Mount {
                     error: e,
                     was_connected,
                 } => {
-                    // A healthy subscription starts a new retry sequence. Without
-                    // this reset, unrelated failures accumulate over the process
-                    // lifetime and eventually disable events for an hour.
-                    if was_connected {
-                        backoff.reset();
-                    }
-                    let delay = backoff.next_delay();
+                    let delay = error_delay(&mut backoff, was_connected, started.elapsed());
                     tracing::error!(
                         target: "drive::remote_events",
                         error = %e,
@@ -879,6 +883,17 @@ mod tests {
         reconnect_delay(&mut backoff, Duration::from_secs(1));
         reconnect_delay(&mut backoff, Duration::from_secs(1));
         assert_eq!(reconnect_delay(&mut backoff, Duration::from_secs(61)).as_secs(), 1);
+    }
+
+    #[test]
+    fn error_after_short_subscribed_stream_keeps_backing_off() {
+        let mut backoff = BackoffState::new();
+        let short = Duration::from_secs(5);
+        let delays = (0..3)
+            .map(|_| error_delay(&mut backoff, true, short).as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [1, 2, 4]);
+        assert_eq!(error_delay(&mut backoff, true, Duration::from_secs(61)).as_secs(), 1);
     }
 
     #[test]
