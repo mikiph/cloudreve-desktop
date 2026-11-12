@@ -446,6 +446,23 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
     // MARK: - Mutations
 
+    /// Keeps our own record of a refused name; macOS soon drops the failed item
+    /// from its pending list, but the popup must keep offering the fix.
+    private func recordRefusedName(
+        driveID: String, itemIdentifier: String, parentIdentifier: String,
+        filename: String, operation: String
+    ) {
+        do {
+            try RefusedNameStore.record(
+                driveID: driveID, itemIdentifier: itemIdentifier,
+                parentIdentifier: parentIdentifier, filename: filename, operation: "upload")
+        } catch {
+            logger.error("could not record refused name: \(error.localizedDescription, privacy: .public)")
+        }
+        logger.notice(
+            "refused name for \(filename, privacy: .private(mask: .hash)) (\(operation, privacy: .public))")
+    }
+
     func createItem(
         basedOn itemTemplate: NSFileProviderItem,
         fields: NSFileProviderItemFields,
@@ -490,7 +507,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
         do {
             try NameValidation.validate(itemTemplate.filename)
+            try? RefusedNameStore.remove(
+                driveID: store.drive.id, itemIdentifier: itemTemplate.itemIdentifier.rawValue)
         } catch {
+            recordRefusedName(
+                driveID: store.drive.id, itemIdentifier: itemTemplate.itemIdentifier.rawValue,
+                parentIdentifier: itemTemplate.parentItemIdentifier.rawValue,
+                filename: itemTemplate.filename, operation: "create")
             completionHandler(nil, [], false, FileProviderEnumerator.mapError(error))
             return progress
         }
@@ -647,7 +670,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         if changedFields.contains(.filename) {
             do {
                 try NameValidation.validate(item.filename)
+                try? RefusedNameStore.remove(
+                    driveID: store.drive.id, itemIdentifier: item.itemIdentifier.rawValue)
             } catch {
+                recordRefusedName(
+                    driveID: store.drive.id, itemIdentifier: item.itemIdentifier.rawValue,
+                    parentIdentifier: item.parentItemIdentifier.rawValue,
+                    filename: item.filename, operation: "modify")
                 completionHandler(nil, [], false, FileProviderEnumerator.mapError(error))
                 return progress
             }
@@ -883,6 +912,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             completionHandler(nil)
             return Progress()
         }
+        try? RefusedNameStore.remove(driveID: store.drive.id, itemIdentifier: identifier.rawValue)
         Task {
             do {
                 let uri = store.uri(for: identifier)
