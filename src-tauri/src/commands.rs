@@ -1040,12 +1040,15 @@ pub async fn resolve_file_provider_issue(
             target,
         )
         .await?;
-        return cloudreve_sync::fileprovider::signal_cannot_synchronize_resolved(
-            &domain_id,
-            &drive.name,
-        )
-        .await
-        .map_err(|error| error.to_string());
+        cloudreve_sync::fileprovider::signal_cannot_synchronize_resolved(&domain_id, &drive.name)
+            .await
+            .map_err(|error| error.to_string())?;
+        if crate::file_provider_issue::should_request_upload(&issue) {
+            tokio::time::sleep(crate::file_provider_issue::UPLOAD_REQUEST_DELAY).await;
+            crate::file_provider_issue::request_upload_best_effort(&domain_id, &drive.name, &issue)
+                .await;
+        }
+        return Ok(());
     }
     if action != "retry" {
         return Err("Only retry is available for this Finder issue".to_string());
@@ -1090,6 +1093,7 @@ pub async fn auto_fix_invalid_name_issues(
     let (drives, issues) = file_provider_issues(&state).await?;
     let mut result = crate::file_provider_issue::AutoFixResult::default();
     let mut touched = std::collections::BTreeSet::<String>::new();
+    let mut fixed = Vec::new();
     for issue in crate::file_provider_issue::invalid_name_issues(&issues, drive_id.as_deref()) {
         let Some(drive) = drives.iter().find(|drive| drive.id == issue.drive_id) else {
             result.record(&issue.filename, Err("Drive is no longer available".to_string()));
@@ -1107,6 +1111,7 @@ pub async fn auto_fix_invalid_name_issues(
         .await;
         if outcome.is_ok() {
             touched.insert(drive.id.clone());
+            fixed.push((drive, issue));
         }
         result.record(&issue.filename, outcome);
     }
@@ -1121,6 +1126,14 @@ pub async fn auto_fix_invalid_name_issues(
             {
                 tracing::warn!(target: "fileprovider", %error, "Could not signal after batch name fix");
             }
+        }
+    }
+    if fixed.iter().any(|(_, issue)| crate::file_provider_issue::should_request_upload(issue)) {
+        tokio::time::sleep(crate::file_provider_issue::UPLOAD_REQUEST_DELAY).await;
+        for (drive, issue) in fixed {
+            let domain_id = cloudreve_sync::fileprovider::domain_identifier(&drive.id);
+            crate::file_provider_issue::request_upload_best_effort(&domain_id, &drive.name, issue)
+                .await;
         }
     }
     Ok(result)
