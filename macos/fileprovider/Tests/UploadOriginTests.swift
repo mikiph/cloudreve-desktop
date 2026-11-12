@@ -77,11 +77,11 @@ private final class OriginProtocol: URLProtocol {
 
         // 4. Object storage.
         err = await run(["upload_urls": ["https://bucket.s3.invalid/obj?X-Amz-Signature=x"],
-            "storage_policy": ["type": "s3"]])
+            "storage_policy": ["type": "mystery"]])
         guard case CloudreveError.unsupportedStoragePolicy(let type)? = err else {
             preconditionFailure("expected unsupportedStoragePolicy, got \(String(describing: err))")
         }
-        precondition(type == "s3")
+        precondition(type == "mystery")
         precondition(!OriginProtocol.calls.contains { $0.host == "bucket.s3.invalid" })
         precondition(OriginProtocol.calls.contains { $0.method == "DELETE" && $0.host == "test.invalid" && $0.path == "/api/v4/file/upload" })
         let mapped = FileProviderEnumerator.mapError(CloudreveError.unsupportedStoragePolicy("s3")) as NSError

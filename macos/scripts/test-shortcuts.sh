@@ -17,6 +17,7 @@ swiftc -swift-version 5 \
     "$ROOT/macos/fileprovider/Sources/CloudreveClient.swift" \
     "$ROOT/macos/fileprovider/Sources/FileProviderStateDatabase.swift" \
     "$ROOT/macos/fileprovider/Sources/UploadEncryption.swift" \
+    "$ROOT/macos/fileprovider/Sources/ObjectStorageUpload.swift" \
     "$ROOT/macos/fileprovider/Tests/ShortcutTests.swift"
 
 "$TEST_BINARY"
