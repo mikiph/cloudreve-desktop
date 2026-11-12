@@ -118,7 +118,166 @@ pub struct FileProviderIssue {
     pub error_domain: Option<String>,
     pub error_code: Option<i64>,
     pub conflict_id: Option<String>,
+    /// Finder identifier of the containing folder; only for `refused_name` issues
+    /// (and pending ones that share an item with a refused-name row).
+    #[serde(default)]
+    pub parent_identifier: Option<String>,
     pub updated_at: i64,
+}
+
+/// A name the extension refused, recorded by the extension itself because
+/// macOS drops the failed item from its pending list shortly afterwards.
+#[derive(Clone, Debug, Deserialize)]
+struct RefusedNameRow {
+    drive_id: String,
+    item_identifier: String,
+    parent_identifier: String,
+    filename: String,
+    operation: String,
+    message: String,
+    updated_at: i64,
+}
+
+const REFUSED_NAMES_NAMESPACE: &str = "fileprovider-refused-names";
+
+fn parse_refused_rows(
+    records: Vec<cloudreve_sync::fileprovider_db::Record>,
+) -> Vec<(cloudreve_sync::fileprovider_db::Record, RefusedNameRow)> {
+    records
+        .into_iter()
+        .filter_map(|record| match serde_json::from_str::<RefusedNameRow>(&record.payload) {
+            Ok(row) => Some((record, row)),
+            Err(error) => {
+                tracing::warn!(target: "fileprovider", key = %record.key, %error, "Skipping unreadable refused-name record");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Adds refused-name rows as `invalid_name` issues. A pending issue for the
+/// same item wins (it carries the system's error) but learns the parent.
+fn add_refused_names(
+    issues: &mut Vec<FileProviderIssue>,
+    rows: Vec<RefusedNameRow>,
+    drive_names: &HashMap<String, String>,
+) {
+    for row in rows {
+        let Some(drive_name) = drive_names.get(&row.drive_id) else {
+            continue;
+        };
+        if let Some(existing) = issues
+            .iter_mut()
+            .find(|i| i.drive_id == row.drive_id && i.item_identifier == row.item_identifier)
+        {
+            existing.parent_identifier = Some(row.parent_identifier);
+            continue;
+        }
+        let stable_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            format!("{}\0{}", row.drive_id, row.item_identifier).as_bytes(),
+        );
+        issues.push(FileProviderIssue {
+            id: format!("refused:{stable_id}"),
+            drive_id: row.drive_id,
+            drive_name: drive_name.clone(),
+            item_identifier: row.item_identifier,
+            filename: row.filename,
+            is_folder: false,
+            operation: row.operation,
+            source: "refused_name".to_string(),
+            kind: Some(INVALID_NAME_KIND.to_string()),
+            previous_name: None,
+            suggested_name: None,
+            application: None,
+            message: row.message,
+            error_domain: None,
+            error_code: None,
+            conflict_id: None,
+            parent_identifier: Some(row.parent_identifier),
+            updated_at: row.updated_at,
+        });
+    }
+    sort_issues(issues);
+}
+
+/// A refused-name row still applies while a file with an invalid name exists.
+fn refused_row_still_applies(name_on_disk: Option<&str>) -> bool {
+    name_on_disk.is_some_and(|name| validate_target_name(name).is_err())
+}
+
+/// `<local path of parent>/<filename>`.
+fn join_parent_path(parent_local: &str, filename: &str) -> std::path::PathBuf {
+    std::path::Path::new(parent_local).join(filename)
+}
+
+/// Candidate local paths of an item, most precise first: the item's own
+/// Finder URL, then `<parent folder>/<filename>` (never-synced items have a
+/// temporary identifier Finder may not resolve).
+async fn local_path_candidates(
+    domain_id: &str,
+    drive_name: &str,
+    item_identifier: &str,
+    parent_identifier: Option<&str>,
+    filename: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) =
+        cloudreve_sync::fileprovider::user_visible_item_url(domain_id, drive_name, item_identifier).await
+    {
+        candidates.push(std::path::PathBuf::from(path));
+    }
+    if let Some(parent) = parent_identifier {
+        let base = if parent == cloudreve_sync::fileprovider::ROOT_CONTAINER {
+            cloudreve_sync::fileprovider::user_visible_url(domain_id, drive_name).await
+        } else {
+            cloudreve_sync::fileprovider::user_visible_item_url(domain_id, drive_name, parent).await
+        };
+        if let Some(base) = base {
+            candidates.push(join_parent_path(&base, filename));
+        }
+    }
+    candidates
+}
+
+/// Deletes refused-name rows whose file is gone or whose name is now valid.
+/// Rows whose path cannot be resolved at all are kept (unverified).
+async fn prune_refused_rows(
+    rows: Vec<(cloudreve_sync::fileprovider_db::Record, RefusedNameRow)>,
+    drive_names: &HashMap<String, String>,
+) -> Result<Vec<RefusedNameRow>> {
+    let mut kept = Vec::new();
+    for (record, row) in rows {
+        let Some(drive_name) = drive_names.get(&row.drive_id) else {
+            continue;
+        };
+        let domain_id = cloudreve_sync::fileprovider::domain_identifier(&row.drive_id);
+        let candidates = local_path_candidates(
+            &domain_id,
+            drive_name,
+            &row.item_identifier,
+            Some(&row.parent_identifier),
+            &row.filename,
+        )
+        .await;
+        let existing = candidates.iter().find(|path| path.exists());
+        let applies = if candidates.is_empty() {
+            true
+        } else {
+            refused_row_still_applies(
+                existing
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str()),
+            )
+        };
+        if applies {
+            kept.push(row);
+        } else {
+            cloudreve_sync::fileprovider_db::StateDb::open()?
+                .consume(REFUSED_NAMES_NAMESPACE, &record)?;
+        }
+    }
+    Ok(kept)
 }
 
 fn parse_snapshots(records: Vec<cloudreve_sync::fileprovider_db::Record>) -> Vec<PendingSnapshot> {
@@ -135,7 +294,10 @@ fn parse_snapshots(records: Vec<cloudreve_sync::fileprovider_db::Record>) -> Vec
         .collect()
 }
 
-pub fn list(known_drive_ids: &HashSet<String>) -> Result<Vec<FileProviderIssue>> {
+/// `drive_names` maps every known drive id to its display name.
+pub async fn list(drive_names: &HashMap<String, String>) -> Result<Vec<FileProviderIssue>> {
+    let known_drive_ids = drive_names.keys().cloned().collect::<HashSet<_>>();
+    let known_drive_ids = &known_drive_ids;
     let snapshots = parse_snapshots(
         cloudreve_sync::fileprovider_db::StateDb::open()?.records("fileprovider-pending")?,
     );
@@ -152,6 +314,11 @@ pub fn list(known_drive_ids: &HashSet<String>) -> Result<Vec<FileProviderIssue>>
     }
     let conflicts = crate::upload_conflict::list()?;
     let mut issues = merge(snapshots, conflicts, known_drive_ids);
+    let refused = parse_refused_rows(
+        cloudreve_sync::fileprovider_db::StateDb::open()?.records(REFUSED_NAMES_NAMESPACE)?,
+    );
+    let refused = prune_refused_rows(refused, drive_names).await?;
+    add_refused_names(&mut issues, refused, drive_names);
     annotate_invalid_names(&mut issues, &|drive_id| {
         crate::saved_items::read_state(&format!("identities-{drive_id}.json")).unwrap_or_default()
     });
@@ -236,16 +403,24 @@ pub async fn rename_item_locally(
     domain_id: &str,
     drive_name: &str,
     item_identifier: &str,
+    parent_identifier: Option<&str>,
+    filename: &str,
     target: RenameTarget,
 ) -> Result<(), String> {
-    let current = cloudreve_sync::fileprovider::user_visible_item_url(
+    let candidates = local_path_candidates(
         domain_id,
         drive_name,
         item_identifier,
+        parent_identifier,
+        filename,
     )
-    .await
-    .ok_or_else(|| "Finder could not locate this item".to_string())?;
-    let current = std::path::PathBuf::from(current);
+    .await;
+    let current = candidates
+        .iter()
+        .find(|path| path.exists())
+        .or(candidates.first())
+        .cloned()
+        .ok_or_else(|| "Finder could not locate this item".to_string())?;
     let target = match target {
         RenameTarget::Name(name) => name,
         RenameTarget::AutoFix => {
@@ -309,6 +484,7 @@ fn merge(
                     error_domain: Some(item.error_domain),
                     error_code: Some(item.error_code),
                     conflict_id: None,
+                    parent_identifier: None,
                     updated_at: snapshot.updated_at,
                 },
             );
@@ -352,12 +528,18 @@ fn merge(
                 error_domain: Some("NSFileProviderErrorDomain".to_string()),
                 error_code: Some(-2005),
                 conflict_id: Some(conflict.id),
+                parent_identifier: None,
                 updated_at: conflict.updated_at,
             },
         );
     }
 
     let mut issues = issues.into_values().collect::<Vec<_>>();
+    sort_issues(&mut issues);
+    issues
+}
+
+fn sort_issues(issues: &mut [FileProviderIssue]) {
     issues.sort_by(|left, right| {
         right
             .updated_at
@@ -366,7 +548,6 @@ fn merge(
             .then_with(|| left.filename.cmp(&right.filename))
             .then_with(|| left.item_identifier.cmp(&right.item_identifier))
     });
-    issues
 }
 
 #[cfg(test)]
@@ -607,6 +788,62 @@ mod tests {
         assert_eq!(result.fixed, 1);
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].filename, "c?d");
+    }
+
+    fn refused_row(drive: &str, item: &str, filename: &str) -> RefusedNameRow {
+        RefusedNameRow {
+            drive_id: drive.into(),
+            item_identifier: item.into(),
+            parent_identifier: "cloudreve-item:/parent".into(),
+            filename: filename.into(),
+            operation: "upload".into(),
+            message: format!("{INVALID_NAME_MESSAGE_PREFIX}: x"),
+            updated_at: 5,
+        }
+    }
+
+    fn names() -> HashMap<String, String> {
+        HashMap::from([("drive-1".to_string(), "My Files".to_string())])
+    }
+
+    #[test]
+    fn refused_name_row_becomes_an_invalid_name_issue() {
+        let mut issues = Vec::new();
+        add_refused_names(
+            &mut issues,
+            vec![refused_row("drive-1", "tmp-1", "CleanShot X?.zip"), refused_row("gone", "tmp-2", "a?")],
+            &names(),
+        );
+        assert_eq!(issues.len(), 1, "rows of unknown drives are skipped");
+        assert_eq!(issues[0].kind.as_deref(), Some("invalid_name"));
+        assert_eq!(issues[0].source, "refused_name");
+        assert_eq!(issues[0].drive_name, "My Files");
+        assert_eq!(issues[0].parent_identifier.as_deref(), Some("cloudreve-item:/parent"));
+        assert_eq!(issues[0].previous_name, None);
+    }
+
+    #[test]
+    fn refused_row_dedupes_against_the_pending_issue_for_the_same_item() {
+        let mut issues = vec![invalid_issue("drive-1", "tmp-1", "a?b.txt")];
+        add_refused_names(&mut issues, vec![refused_row("drive-1", "tmp-1", "a?b.txt")], &names());
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].source, "pending");
+        assert_eq!(issues[0].parent_identifier.as_deref(), Some("cloudreve-item:/parent"));
+    }
+
+    #[test]
+    fn refused_row_is_pruned_when_file_missing_or_name_valid() {
+        assert!(refused_row_still_applies(Some("a?b.txt")));
+        assert!(!refused_row_still_applies(None));
+        assert!(!refused_row_still_applies(Some("a_b.txt")));
+    }
+
+    #[test]
+    fn parent_fallback_joins_the_filename_onto_the_parent_path() {
+        assert_eq!(
+            join_parent_path("/Users/x/Library/CloudStorage/Drive/docs", "a?b.zip"),
+            std::path::PathBuf::from("/Users/x/Library/CloudStorage/Drive/docs/a?b.zip")
+        );
     }
 
     #[test]

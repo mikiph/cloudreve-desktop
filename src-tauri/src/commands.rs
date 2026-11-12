@@ -956,11 +956,13 @@ async fn file_provider_issues(
         .get()
         .ok_or_else(|| "App not yet initialized".to_string())?;
     let drives = app_state.drive_manager.list_drives().await;
-    let drive_ids = drives
+    let drive_names = drives
         .iter()
-        .map(|drive| drive.id.clone())
-        .collect::<std::collections::HashSet<_>>();
-    let issues = crate::file_provider_issue::list(&drive_ids).map_err(|error| error.to_string())?;
+        .map(|drive| (drive.id.clone(), drive.name.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let issues = crate::file_provider_issue::list(&drive_names)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok((drives, issues))
 }
 
@@ -1033,6 +1035,8 @@ pub async fn resolve_file_provider_issue(
             &domain_id,
             &drive.name,
             &issue.item_identifier,
+            issue.parent_identifier.as_deref(),
+            &issue.filename,
             target,
         )
         .await?;
@@ -1096,6 +1100,8 @@ pub async fn auto_fix_invalid_name_issues(
             &domain_id,
             &drive.name,
             &issue.item_identifier,
+            issue.parent_identifier.as_deref(),
+            &issue.filename,
             crate::file_provider_issue::RenameTarget::AutoFix,
         )
         .await;

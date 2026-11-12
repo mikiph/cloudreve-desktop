@@ -68,10 +68,11 @@ export interface FileProviderIssue {
   filename: string;
   is_folder: boolean;
   operation: "upload" | "download" | "delete";
-  source: "pending" | "upload_conflict";
+  source: "pending" | "upload_conflict" | "refused_name";
   kind?: "locked" | "stale" | "unverified" | "invalid_name" | null;
   previous_name?: string | null;
   suggested_name?: string | null;
+  parent_identifier?: string | null;
   application?: string;
   message: string;
   error_domain?: string;
