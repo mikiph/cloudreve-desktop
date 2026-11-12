@@ -143,8 +143,10 @@ impl PushHealth {
             Observation::NotUpgraded { status, code } => {
                 self.mark_reachable();
                 let server_trouble = matches!(status, Some(500..=599));
-                let auth = code == 401 || code == 403;
-                if !server_trouble && !auth {
+                let auth_or_limited = code == 401
+                    || code == 403
+                    || matches!(status, Some(401) | Some(403) | Some(429));
+                if !server_trouble && !auth_or_limited {
                     self.unsupported_strikes.push(now_ms);
                     if self.unsupported_strikes.len() > UNSUPPORTED_STRIKES {
                         self.unsupported_strikes.remove(0);
@@ -280,6 +282,17 @@ mod tests {
             h.observe(not_upgraded(200, 401), t);
         }
         assert_ne!(h.state(), PushState::Degraded);
+    }
+
+    #[test]
+    fn proxy_auth_and_rate_limit_statuses_are_not_strikes() {
+        for status in [403u16, 429] {
+            let mut h = PushHealth::new();
+            for t in [0, 60_000, 120_000] {
+                h.observe(not_upgraded(status, -1), t);
+            }
+            assert_ne!(h.state(), PushState::Degraded, "status {status}");
+        }
     }
 
     #[test]
