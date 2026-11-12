@@ -358,6 +358,32 @@ pub fn invalid_name_issues<'a>(
         .collect()
 }
 
+/// Whether a fixed issue's item should be asked to upload (files only).
+pub fn should_request_upload(issue: &FileProviderIssue) -> bool {
+    !issue.is_folder
+}
+
+/// Delay giving the system time to notice a local rename before prodding it.
+pub const UPLOAD_REQUEST_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Best effort: asks File Provider to upload a just-renamed item. Never fails the caller.
+pub async fn request_upload_best_effort(domain_id: &str, drive_name: &str, issue: &FileProviderIssue) {
+    if !should_request_upload(issue) {
+        return;
+    }
+    if let Err(error) = cloudreve_sync::fileprovider::retry_item_upload(
+        domain_id,
+        drive_name,
+        &issue.item_identifier,
+        issue.error_domain.as_deref(),
+        issue.error_code,
+    )
+    .await
+    {
+        tracing::warn!(target: "fileprovider", %error, "Could not request upload after name fix");
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct FixFailure {
     pub filename: String,
@@ -565,6 +591,23 @@ mod tests {
         ]);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].drive_id, "drive-1");
+    }
+
+    #[test]
+    fn upload_is_requested_for_files_only() {
+        let mut issue = conflict_issue_for_upload_test();
+        issue.is_folder = false;
+        assert!(should_request_upload(&issue));
+        issue.is_folder = true;
+        assert!(!should_request_upload(&issue));
+    }
+
+    fn conflict_issue_for_upload_test() -> FileProviderIssue {
+        let known = HashSet::from(["drive-1".to_string()]);
+        merge(vec![pending_snapshot()], Vec::new(), &known)
+            .into_iter()
+            .next()
+            .expect("issue")
     }
 
     fn pending_snapshot() -> PendingSnapshot {
