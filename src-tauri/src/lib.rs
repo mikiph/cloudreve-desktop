@@ -212,7 +212,11 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
                         if SHUTDOWN_STARTED.load(Ordering::Acquire) { break; }
                         let Some(mount) = manager.get_drive(&drive.id).await else { continue; };
                         let flags = mount.get_status_flags().await;
-                        let connected = flags.is_event_push_subscribed() && !flags.is_credential_expired();
+                        let connected = cloudreve_sync::drive::push_health::domain_connected(
+                            flags.is_event_push_subscribed(),
+                            flags.is_event_push_degraded(),
+                            flags.is_credential_expired(),
+                        );
                         // macOS can suspend the extension between durable
                         // refresh pages. Wake existing work without adding a
                         // new marker or repeating the server search.

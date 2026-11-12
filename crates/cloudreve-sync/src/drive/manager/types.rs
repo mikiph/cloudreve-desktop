@@ -150,6 +150,7 @@ pub enum DriveInfoStatus {
     Active,
     // Event push subscription is lost
     EventPushLost,
+    EventPushDegraded,
     /// Credentials have expired
     CredentialExpired,
 }

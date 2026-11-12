@@ -138,6 +138,7 @@ pub struct MountStatusFlags(u8);
 impl MountStatusFlags {
     const CREDENTIAL_EXPIRED: u8 = 1 << 0;
     const EVENT_PUSH_SUBSCRIBED: u8 = 1 << 1;
+    const EVENT_PUSH_DEGRADED: u8 = 1 << 2;
 
     /// Create a new MountStatusFlags with all flags cleared
     pub fn new() -> Self {
@@ -169,6 +170,20 @@ impl MountStatusFlags {
             self.0 |= Self::EVENT_PUSH_SUBSCRIBED;
         } else {
             self.0 &= !Self::EVENT_PUSH_SUBSCRIBED;
+        }
+    }
+
+    /// Check if live events are known to be unavailable (degraded mode)
+    pub fn is_event_push_degraded(&self) -> bool {
+        self.0 & Self::EVENT_PUSH_DEGRADED != 0
+    }
+
+    /// Set the event push degraded flag
+    pub fn set_event_push_degraded(&mut self, degraded: bool) {
+        if degraded {
+            self.0 |= Self::EVENT_PUSH_DEGRADED;
+        } else {
+            self.0 &= !Self::EVENT_PUSH_DEGRADED;
         }
     }
 
@@ -446,6 +461,14 @@ impl Mount {
             .lock()
             .await
             .set_event_push_subscribed(subscribed);
+    }
+
+    /// Set the event push degraded flag
+    pub async fn set_event_push_degraded(&self, degraded: bool) {
+        self.status_flags
+            .lock()
+            .await
+            .set_event_push_degraded(degraded);
     }
 
     /// Store the handle for the background initial sync task so it can be
