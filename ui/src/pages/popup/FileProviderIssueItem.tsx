@@ -207,13 +207,10 @@ export default function FileProviderIssueItem({
                         variant={canUndoRename ? "outlined" : "contained"}
                         disabled={busy}
                         onClick={() => handleResolve("auto_fix")}
+                        title={issue.suggested_name ? `Rename to “${issue.suggested_name}”` : undefined}
                         sx={{ textTransform: "none", maxWidth: "100%" }}
                       >
-                        {resolvingAction === "auto_fix"
-                          ? "Renaming…"
-                          : issue.suggested_name
-                            ? `Fix: ${issue.suggested_name}`
-                            : "Auto-fix name"}
+                        {resolvingAction === "auto_fix" ? "Renaming…" : "Fix"}
                       </Button>
                       <Button
                         size="small"
