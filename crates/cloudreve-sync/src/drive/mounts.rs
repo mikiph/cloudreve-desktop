@@ -210,6 +210,11 @@ pub struct Mount {
     #[cfg(any(target_os = "macos", windows))]
     share_poll_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     remote_event_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Tracks whether the server's live event stream works (degraded mode).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) push_health: Mutex<crate::drive::push_health::PushHealth>,
+    #[cfg(target_os = "macos")]
+    push_fallback_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     #[cfg(target_os = "macos")]
     pub(crate) fileprovider_audit_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     #[cfg(target_os = "macos")]
@@ -341,6 +346,9 @@ impl Mount {
             #[cfg(any(target_os = "macos", windows))]
             share_poll_handle: Arc::new(tokio::sync::Mutex::new(None)),
             remote_event_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            push_health: Mutex::new(crate::drive::push_health::PushHealth::new()),
+            #[cfg(target_os = "macos")]
+            push_fallback_handle: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(target_os = "macos")]
             fileprovider_audit_handle: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(target_os = "macos")]
@@ -655,6 +663,14 @@ impl Mount {
     }
 
     pub async fn spawn_remote_event_processor(&self, s: Arc<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let fallback = s.clone();
+            let handle = tokio::spawn(async move {
+                Self::run_push_fallback(fallback).await;
+            });
+            *self.push_fallback_handle.lock().await = Some(handle);
+        }
         let handle = tokio::spawn(async move {
             Self::process_remote_events(s).await;
         });
@@ -841,6 +857,12 @@ impl Mount {
 
     pub async fn shutdown(&self) {
         tracing::info!(target: "drive::mounts", id=%self.id, "Shutting down Mount");
+
+        #[cfg(target_os = "macos")]
+        if let Some(handle) = self.push_fallback_handle.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         // Stop the remote event listener
         if let Some(handle) = self.remote_event_handle.lock().await.take() {

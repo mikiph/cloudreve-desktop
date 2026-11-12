@@ -307,6 +307,7 @@ extension RemoteStore {
                 "failed to persist presented containers: \(error.localizedDescription, privacy: .public)"
             )
         }
+        FinderActivityHeartbeat.touch(driveID: drive.id)
     }
 
     func presentedContainersSnapshot() -> [NSFileProviderItemIdentifier] {

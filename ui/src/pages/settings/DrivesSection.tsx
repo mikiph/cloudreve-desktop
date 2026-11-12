@@ -225,6 +225,8 @@ export default function DrivesSection() {
         return "#4caf50"; // green
       case "event_push_lost":
         return "#ff9800"; // orange
+      case "event_push_degraded":
+        return "#2196f3"; // blue (informational)
       case "credential_expired":
         return "#f44336"; // red
       default:
@@ -243,6 +245,8 @@ export default function DrivesSection() {
         return t("settings.driveStatus.active");
       case "event_push_lost":
         return t("settings.driveStatus.eventPushLost");
+      case "event_push_degraded":
+        return t("settings.driveStatus.eventPushDegraded");
       case "credential_expired":
         return t("settings.driveStatus.credentialExpired");
       default:

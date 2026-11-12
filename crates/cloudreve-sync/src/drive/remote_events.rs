@@ -31,6 +31,82 @@ const EVENT_VERIFY_CONCURRENCY: usize = 8;
 #[cfg(target_os = "macos")]
 const EVENT_VERIFY_ATTEMPTS: u32 = 3;
 
+#[cfg(target_os = "macos")]
+const PUSH_HEALTH_NAMESPACE: &str = "fp-push-health";
+#[cfg(target_os = "macos")]
+const FINDER_ACTIVITY_NAMESPACE: &str = "fp-finder-activity";
+#[cfg(target_os = "macos")]
+const FALLBACK_TICK_SECS: u64 = 60;
+#[cfg(target_os = "macos")]
+const FALLBACK_WINDOW_MS: i64 = 3_600_000;
+
+/// Persisted degraded-mode state, one row per drive.
+#[cfg(target_os = "macos")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PushHealthRecord {
+    degraded_since: i64,
+    reason: String,
+    #[serde(default)]
+    passes: Vec<i64>,
+}
+
+/// Heartbeat row written by the File Provider extension.
+#[cfg(target_os = "macos")]
+#[derive(serde::Deserialize)]
+struct FinderActivity {
+    at: i64,
+}
+
+#[cfg(target_os = "macos")]
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn reason_name(reason: crate::drive::push_health::DegradedReason) -> &'static str {
+    use crate::drive::push_health::DegradedReason;
+    match reason {
+        DegradedReason::Unsupported => "unsupported",
+        DegradedReason::Flapping => "flapping",
+        DegradedReason::Buffered => "buffered",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_reason(name: &str) -> crate::drive::push_health::DegradedReason {
+    use crate::drive::push_health::DegradedReason;
+    match name {
+        "flapping" => DegradedReason::Flapping,
+        "buffered" => DegradedReason::Buffered,
+        _ => DegradedReason::Unsupported,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn write_push_health_record(drive_id: String, record: PushHealthRecord) -> Result<()> {
+    crate::fileprovider_db::run_blocking(move || {
+        let payload = serde_json::to_string(&record)?;
+        crate::fileprovider_db::StateDb::open()?.put(PUSH_HEALTH_NAMESPACE, &drive_id, &payload)
+    })
+    .await
+}
+
+#[cfg(target_os = "macos")]
+async fn read_push_health_record(drive_id: String) -> Result<Option<PushHealthRecord>> {
+    crate::fileprovider_db::run_blocking(move || {
+        let mut db = crate::fileprovider_db::StateDb::open()?;
+        Ok(db
+            .records(PUSH_HEALTH_NAMESPACE)?
+            .into_iter()
+            .find(|row| row.key == drive_id)
+            .and_then(|row| serde_json::from_str::<PushHealthRecord>(&row.payload).ok()))
+    })
+    .await
+}
+
 /// Outcome of asking the server whether an event's path exists.
 #[cfg(target_os = "macos")]
 enum EventVerification {
@@ -106,8 +182,15 @@ enum ListenResult {
     Error {
         error: anyhow::Error,
         was_connected: bool,
+        /// `(http status, envelope code)` when the server answered the
+        /// subscribe request over HTTP without upgrading to SSE.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        not_upgraded: Option<(Option<u16>, i32)>,
     },
     ReconnectRequired,
+    /// The stream stayed silent before any `subscribed` event arrived.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    IdleBeforeSubscribed,
     StreamEnded,
 }
 
@@ -115,24 +198,53 @@ impl Mount {
     pub async fn process_remote_events(s: Arc<Self>) {
         tracing::info!(target: "drive::remote_events", "Listening to remote events");
         let mut backoff = BackoffState::new();
+        #[cfg(target_os = "macos")]
+        let mut probe_attempt: u32 = 0;
+        #[cfg(target_os = "macos")]
+        s.restore_push_health().await;
 
         loop {
             let started = std::time::Instant::now();
             let result = s.listen_remote_events().await;
-            match result {
-                ListenResult::ReconnectRequired => {
+            #[cfg(target_os = "macos")]
+            {
+                use crate::drive::push_health::Observation;
+                let observation = match &result {
+                    ListenResult::Error {
+                        not_upgraded: Some((status, code)),
+                        ..
+                    } => Observation::NotUpgraded {
+                        status: *status,
+                        code: *code,
+                    },
+                    ListenResult::Error {
+                        was_connected: true,
+                        ..
+                    }
+                    | ListenResult::ReconnectRequired
+                    | ListenResult::StreamEnded => Observation::StreamLost {
+                        connected_for: started.elapsed(),
+                    },
+                    ListenResult::IdleBeforeSubscribed => Observation::IdleBeforeSubscribed,
+                    ListenResult::Error { .. } => Observation::OtherFailure,
+                };
+                s.on_push_observation(observation).await;
+            }
+            let delay = match result {
+                ListenResult::ReconnectRequired | ListenResult::IdleBeforeSubscribed => {
                     let delay = reconnect_delay(&mut backoff, started.elapsed());
                     tracing::info!(target: "drive::remote_events", delay_secs = delay.as_secs(), "Reconnect required, re-subscribing after delay");
-                    tokio::time::sleep(delay).await;
+                    delay
                 }
                 ListenResult::StreamEnded => {
                     let delay = reconnect_delay(&mut backoff, started.elapsed());
                     tracing::warn!(target: "drive::remote_events", delay_secs = delay.as_secs(), "Event stream ended unexpectedly, reconnecting after delay");
-                    tokio::time::sleep(delay).await;
+                    delay
                 }
                 ListenResult::Error {
                     error: e,
                     was_connected,
+                    ..
                 } => {
                     let delay = error_delay(&mut backoff, was_connected, started.elapsed());
                     tracing::error!(
@@ -142,9 +254,26 @@ impl Mount {
                         delay_secs = delay.as_secs(),
                         "Failed to listen to remote events, retrying"
                     );
-                    tokio::time::sleep(delay).await;
+                    delay
                 }
-            }
+            };
+            // While live events are unavailable, probe on a slow jittered
+            // schedule instead of hammering the server.
+            #[cfg(target_os = "macos")]
+            let delay = {
+                use crate::drive::push_health::{PushState, probe_delay};
+                if s.push_health.lock().await.state() == PushState::Degraded {
+                    let jitter = f64::from(uuid::Uuid::new_v4().as_bytes()[0]) / 127.5 - 1.0;
+                    let delay = probe_delay(probe_attempt, jitter);
+                    probe_attempt = probe_attempt.saturating_add(1);
+                    tracing::info!(target: "drive::remote_events", delay_secs = delay.as_secs(), "Live updates unavailable, probing again after delay");
+                    delay
+                } else {
+                    probe_attempt = 0;
+                    delay
+                }
+            };
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -170,29 +299,72 @@ impl Mount {
         let mut subscription = match subscription {
             Ok(sub) => sub,
             Err(e) => {
+                let not_upgraded = match &e {
+                    cloudreve_api::ApiError::SseNotUpgraded { code, status, .. } => {
+                        Some((*status, *code))
+                    }
+                    _ => None,
+                };
                 return ListenResult::Error {
                     error: e.into(),
                     was_connected: false,
+                    not_upgraded,
                 };
             }
         };
         let mut was_connected = false;
+        let idle_timeout = Duration::from_secs(EVENT_STREAM_IDLE_TIMEOUT_SECS);
+        let mut last_activity = std::time::Instant::now();
+        #[cfg(target_os = "macos")]
+        let mut subscribed_at: Option<std::time::Instant> = None;
+        #[cfg(target_os = "macos")]
+        let mut healthy_reported = false;
 
         loop {
-            let next_event = tokio::time::timeout(
-                Duration::from_secs(EVENT_STREAM_IDLE_TIMEOUT_SECS),
-                subscription.next_event(),
-            )
-            .await;
+            let wait = idle_timeout.saturating_sub(last_activity.elapsed());
+            #[cfg(target_os = "macos")]
+            let wait = match subscribed_at {
+                Some(at) if !healthy_reported => {
+                    wait.min(Duration::from_secs(HEALTHY_STREAM_SECS).saturating_sub(at.elapsed()))
+                }
+                _ => wait,
+            };
+            let next_event = tokio::time::timeout(wait, subscription.next_event()).await;
+            if next_event.is_ok() {
+                last_activity = std::time::Instant::now();
+            }
 
             match next_event {
                 Err(_) => {
+                    if last_activity.elapsed() < idle_timeout {
+                        // Woke for the stream-health deadline, not for silence.
+                        #[cfg(target_os = "macos")]
+                        if let Some(at) = subscribed_at {
+                            if !healthy_reported
+                                && at.elapsed() >= Duration::from_secs(HEALTHY_STREAM_SECS)
+                            {
+                                healthy_reported = true;
+                                // Report subscribed before the health change so a
+                                // recovered drive never shows as disconnected.
+                                self.set_event_push_subscribed(true).await;
+                                self.on_push_observation(
+                                    crate::drive::push_health::Observation::StreamHealthy,
+                                )
+                                .await;
+                            }
+                        }
+                        continue;
+                    }
                     tracing::warn!(
                         target: "drive::remote_events",
                         idle_secs = EVENT_STREAM_IDLE_TIMEOUT_SECS,
                         "Event stream became idle, reconnecting"
                     );
                     self.set_event_push_subscribed(false).await;
+                    #[cfg(target_os = "macos")]
+                    if !was_connected {
+                        return ListenResult::IdleBeforeSubscribed;
+                    }
                     return ListenResult::ReconnectRequired;
                 }
                 Ok(Ok(Some(event))) => match event {
@@ -223,6 +395,7 @@ impl Mount {
                                         return ListenResult::Error {
                                             error: error.context("File Provider events could not be committed"),
                                             was_connected,
+                                            not_upgraded: None,
                                         };
                                     }
                                 }
@@ -235,14 +408,27 @@ impl Mount {
                     }
                     FileEvent::Resumed => {
                         was_connected = true;
-                        self.set_event_push_subscribed(true).await;
+                        self.mark_event_push_subscribed().await;
                         tracing::debug!(target: "drive::remote_events", "Subscription resumed");
                         #[cfg(target_os = "macos")]
-                        self.record_rescan_marker().await;
+                        {
+                            subscribed_at = Some(std::time::Instant::now());
+                            healthy_reported = false;
+                            self.on_push_observation(crate::drive::push_health::Observation::Subscribed)
+                                .await;
+                            self.record_rescan_marker().await;
+                        }
                     }
                     FileEvent::Subscribed => {
                         was_connected = true;
-                        self.set_event_push_subscribed(true).await;
+                        self.mark_event_push_subscribed().await;
+                        #[cfg(target_os = "macos")]
+                        {
+                            subscribed_at = Some(std::time::Instant::now());
+                            healthy_reported = false;
+                            self.on_push_observation(crate::drive::push_health::Observation::Subscribed)
+                                .await;
+                        }
                         tracing::info!(target: "drive::remote_events", "New subscription established, scheduling recovery");
                         #[cfg(target_os = "macos")]
                         {
@@ -275,10 +461,22 @@ impl Mount {
                     return ListenResult::Error {
                         error: e.into(),
                         was_connected,
+                        not_upgraded: None,
                     };
                 }
             }
         }
+    }
+
+    /// Mark the stream subscribed. While degraded, the drive keeps its
+    /// degraded status until the stream proves healthy for 60 s; a short-lived
+    /// subscribe must not flip the UI back to Active.
+    async fn mark_event_push_subscribed(&self) {
+        #[cfg(target_os = "macos")]
+        if self.push_health.lock().await.state() == crate::drive::push_health::PushState::Degraded {
+            return;
+        }
+        self.set_event_push_subscribed(true).await;
     }
 
     #[cfg(target_os = "macos")]
@@ -305,6 +503,126 @@ impl Mount {
             }
         }
         EventVerification::Unverified
+    }
+
+    /// Feed one observation to the push-health state machine and apply the
+    /// resulting status flag and persisted record.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn on_push_observation(&self, observation: crate::drive::push_health::Observation) {
+        use crate::drive::push_health::PushState;
+        let now_ms = now_millis();
+        let (previous, state, offline, reason) = {
+            let mut health = self.push_health.lock().await;
+            let previous = health.state();
+            let state = health.observe(observation, now_ms);
+            (previous, state, health.is_offline(), health.reason())
+        };
+        // Offline while degraded reads as disconnected, as it did before
+        // degraded mode existed.
+        self.set_event_push_degraded(state == PushState::Degraded && !offline)
+            .await;
+
+        let drive_id = self.config.read().await.id.clone();
+        if previous != PushState::Degraded && state == PushState::Degraded {
+            let reason = reason.map(reason_name).unwrap_or("unsupported");
+            tracing::warn!(target: "drive::remote_events", drive = %drive_id, reason, "Live updates unavailable; using bounded refreshes while Finder is in use");
+            let record = PushHealthRecord {
+                degraded_since: now_ms,
+                reason: reason.to_string(),
+                passes: Vec::new(),
+            };
+            if let Err(error) = write_push_health_record(drive_id, record).await {
+                tracing::warn!(target: "drive::remote_events", %error, "Could not persist degraded live-update state");
+            }
+        } else if previous == PushState::Degraded && state != PushState::Degraded {
+            tracing::info!(target: "drive::remote_events", drive = %drive_id, "Live updates restored");
+            let result = crate::fileprovider_db::run_blocking(move || {
+                crate::fileprovider_db::StateDb::open()?.remove(PUSH_HEALTH_NAMESPACE, &drive_id)
+            })
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(target: "drive::remote_events", %error, "Could not clear degraded live-update state");
+            }
+        }
+    }
+
+    /// Start in degraded mode when the previous run ended degraded.
+    #[cfg(target_os = "macos")]
+    async fn restore_push_health(&self) {
+        let drive_id = self.config.read().await.id.clone();
+        match read_push_health_record(drive_id).await {
+            Ok(Some(record)) => {
+                let reason = parse_reason(&record.reason);
+                *self.push_health.lock().await = crate::drive::push_health::PushHealth::degraded(reason);
+                self.set_event_push_degraded(true).await;
+                tracing::info!(target: "drive::remote_events", reason = reason_name(reason), "Starting in degraded live-update mode");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(target: "drive::remote_events", %error, "Could not read degraded live-update state");
+            }
+        }
+    }
+
+    /// While live events are unavailable, run the bounded Finder refresh every
+    /// few minutes, but only while Finder is actually being used.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn run_push_fallback(s: Arc<Self>) {
+        use crate::drive::push_health::{PushState, fallback_pass_due};
+        loop {
+            tokio::time::sleep(Duration::from_secs(FALLBACK_TICK_SECS)).await;
+            let (state, offline) = {
+                let health = s.push_health.lock().await;
+                (health.state(), health.is_offline())
+            };
+            if state != PushState::Degraded || offline {
+                continue;
+            }
+            let drive_id = s.config.read().await.id.clone();
+            let read_id = drive_id.clone();
+            let loaded = crate::fileprovider_db::run_blocking(move || {
+                let mut db = crate::fileprovider_db::StateDb::open()?;
+                let activity = db
+                    .records(FINDER_ACTIVITY_NAMESPACE)?
+                    .into_iter()
+                    .find(|row| row.key == read_id)
+                    .and_then(|row| serde_json::from_str::<FinderActivity>(&row.payload).ok())
+                    .map(|activity| activity.at);
+                let record = db
+                    .records(PUSH_HEALTH_NAMESPACE)?
+                    .into_iter()
+                    .find(|row| row.key == read_id)
+                    .and_then(|row| serde_json::from_str::<PushHealthRecord>(&row.payload).ok());
+                Ok((activity, record))
+            })
+            .await;
+            let (activity, record) = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    tracing::warn!(target: "drive::remote_events", %error, "Could not read Finder activity");
+                    continue;
+                }
+            };
+            let now_ms = now_millis();
+            let mut record = record.unwrap_or_else(|| PushHealthRecord {
+                degraded_since: now_ms,
+                reason: "unsupported".into(),
+                passes: Vec::new(),
+            });
+            if !fallback_pass_due(state, now_ms, activity, &record.passes) {
+                continue;
+            }
+            tracing::info!(target: "drive::remote_events", "Degraded live updates: running bounded refresh");
+            s.schedule_fileprovider_recovery().await;
+            if s.push_health.lock().await.state() != PushState::Degraded {
+                continue;
+            }
+            record.passes.retain(|t| now_ms - *t < FALLBACK_WINDOW_MS);
+            record.passes.push(now_ms);
+            if let Err(error) = write_push_health_record(drive_id, record).await {
+                tracing::warn!(target: "drive::remote_events", %error, "Could not record fallback refresh");
+            }
+        }
     }
 
     /// Refresh the File Provider after a remote event stream reconnects.

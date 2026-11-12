@@ -133,6 +133,7 @@
     "driveStatus": {
       "active": "Active",
       "eventPushLost": "Real time event push lost",
+      "eventPushDegraded": "Live updates unavailable — changes from other devices appear within a few minutes while you browse",
       "credentialExpired": "Credential Expired"
     }
   },

@@ -16,7 +16,11 @@ export interface DriveInfo {
   };
 }
 
-export type DriveStatus = "active" | "event_push_lost" | "credential_expired";
+export type DriveStatus =
+  | "active"
+  | "event_push_lost"
+  | "event_push_degraded"
+  | "credential_expired";
 
 export interface CapacitySummary {
   total: number;

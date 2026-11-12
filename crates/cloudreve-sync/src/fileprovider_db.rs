@@ -194,6 +194,15 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn remove(&mut self, namespace: &str, key: &str) -> Result<()> {
+        self.import_records(namespace)?;
+        diesel::sql_query("DELETE FROM fp_records WHERE namespace=? AND key=?")
+            .bind::<Text, _>(namespace)
+            .bind::<Text, _>(key)
+            .execute(&mut self.connection)?;
+        Ok(())
+    }
+
     /// Compare-and-delete avoids removing a newer value produced by the extension.
     pub fn consume(&mut self, namespace: &str, record: &Record) -> Result<bool> {
         Ok(
