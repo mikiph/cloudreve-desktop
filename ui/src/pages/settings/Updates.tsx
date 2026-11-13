@@ -36,7 +36,7 @@ export default function Updates() {
       {error && <Alert severity="error">{t("updates.error", "Could not complete the update. Your current installation has not been confirmed updated.")} {error}</Alert>}
       {update?.managed && <>
         <Typography variant="body2">{t("updates.managed", "Use your Windows package installer or Microsoft Store to update. This preserves Explorer integration.")}</Typography>
-        <Button onClick={() => openUrl("https://github.com/daddyboiAnderson/cloudreve-desktop/releases")} sx={{ alignSelf: "flex-start" }}>{t("updates.releases", "View releases")}</Button>
+        <Button onClick={() => openUrl("https://github.com/mikiph/cloudreve-desktop/releases")} sx={{ alignSelf: "flex-start" }}>{t("updates.releases", "View releases")}</Button>
       </>}
       {update && !update.managed && !update.version && <Typography variant="body2">{t("updates.current", "You’re up to date.")}</Typography>}
       {update?.version && <>

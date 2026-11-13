@@ -33,12 +33,12 @@ export default function AboutSection() {
     {
       icon: <GitHubIcon fontSize="small" />,
       label: "GitHub",
-      href: "https://github.com/daddyboiAnderson/cloudreve-desktop",
+      href: "https://github.com/mikiph/cloudreve-desktop",
     },
     {
       icon: <BugReportIcon fontSize="small" />,
       label: t("about.reportIssue"),
-      href: "https://github.com/daddyboiAnderson/cloudreve-desktop/issues",
+      href: "https://github.com/mikiph/cloudreve-desktop/issues",
     },
     {
       icon: <ForumIcon fontSize="small" />,

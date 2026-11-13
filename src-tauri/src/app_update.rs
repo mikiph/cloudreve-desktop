@@ -9,10 +9,18 @@ fn trusted_release_url(url: &tauri::Url) -> bool {
         && url.username().is_empty()
         && url.password().is_none()
         && url.port_or_known_default() == Some(443)
-        && url
-            .path()
-            .starts_with("/daddyboiAnderson/cloudreve-desktop/releases/download/")
+        && TRUSTED_RELEASE_PREFIXES
+            .iter()
+            .any(|prefix| url.path().starts_with(prefix))
 }
+
+/// The GitHub account was renamed from daddyboiAnderson to mikiph. Keep the old
+/// owner trusted so manifests published before the rename still install.
+#[cfg(any(target_os = "macos", test))]
+const TRUSTED_RELEASE_PREFIXES: [&str; 2] = [
+    "/mikiph/cloudreve-desktop/releases/download/",
+    "/daddyboiAnderson/cloudreve-desktop/releases/download/",
+];
 
 #[derive(Default)]
 pub struct UpdateState {
@@ -81,13 +89,17 @@ mod tests {
 
     #[test]
     fn update_downloads_are_bound_to_our_https_release_repository() {
-        assert!(trusted_release_url(&tauri::Url::parse("https://github.com/daddyboiAnderson/cloudreve-desktop/releases/download/v0.2.1/app.tar.gz").unwrap()));
         for url in [
-            "http://github.com/daddyboiAnderson/cloudreve-desktop/releases/download/v1/app.tar.gz",
-            "https://github.com.evil.invalid/daddyboiAnderson/cloudreve-desktop/releases/download/v1/app.tar.gz",
+            "https://github.com/mikiph/cloudreve-desktop/releases/download/v0.2.1/app.tar.gz",
+            "https://github.com/daddyboiAnderson/cloudreve-desktop/releases/download/v0.2.1/app.tar.gz",
+        ] { assert!(trusted_release_url(&tauri::Url::parse(url).unwrap()), "{url}"); }
+        for url in [
+            "http://github.com/mikiph/cloudreve-desktop/releases/download/v1/app.tar.gz",
+            "https://github.com.evil.invalid/mikiph/cloudreve-desktop/releases/download/v1/app.tar.gz",
             "https://github.com/other/repo/releases/download/v1/app.tar.gz",
+            "https://github.com/mikiph/cloudreve-desktop/releases/download/../../../other",
             "https://github.com/daddyboiAnderson/cloudreve-desktop/releases/download/../../../other",
-            "https://user:secret@github.com/daddyboiAnderson/cloudreve-desktop/releases/download/v1/app.tar.gz",
+            "https://user:secret@github.com/mikiph/cloudreve-desktop/releases/download/v1/app.tar.gz",
         ] { assert!(!trusted_release_url(&tauri::Url::parse(url).unwrap()), "{url}"); }
     }
 }

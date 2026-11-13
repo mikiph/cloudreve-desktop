@@ -14,7 +14,7 @@ const manifest = {
   platforms: {
     [`darwin-${arch}`]: {
       signature,
-      url: `https://github.com/daddyboiAnderson/cloudreve-desktop/releases/download/v${version}/${archive}`,
+      url: `https://github.com/mikiph/cloudreve-desktop/releases/download/v${version}/${archive}`,
     },
   },
 };
