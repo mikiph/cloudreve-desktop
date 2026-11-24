@@ -12,6 +12,37 @@ enum UploadTargetKind: Equatable {
     case qiniu
     case upyun
     case unsupported(String)
+
+    /// Stable text form stored in the upload session record.
+    var recordValue: String {
+        switch self {
+        case .cloudreve: return "cloudreve"
+        case .slave: return "slave"
+        case .s3Like(let type): return "s3:\(type)"
+        case .oneDrive: return "onedrive"
+        case .qiniu: return "qiniu"
+        case .upyun: return "upyun"
+        case .unsupported(let type): return "unsupported:\(type)"
+        }
+    }
+
+    init?(recordValue: String) {
+        switch recordValue {
+        case "cloudreve": self = .cloudreve
+        case "slave": self = .slave
+        case "onedrive": self = .oneDrive
+        case "qiniu": self = .qiniu
+        case "upyun": self = .upyun
+        default:
+            if recordValue.hasPrefix("s3:") {
+                self = .s3Like(String(recordValue.dropFirst(3)))
+            } else if recordValue.hasPrefix("unsupported:") {
+                self = .unsupported(String(recordValue.dropFirst(12)))
+            } else {
+                return nil
+            }
+        }
+    }
 }
 
 /// Pure, network-free helpers for uploading directly to storage providers.

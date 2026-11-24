@@ -11,13 +11,16 @@ export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE"
 swiftc -swift-version 5 \
     -target arm64-apple-macos13.0 \
     -sdk "$SDK" \
-    -framework Foundation \
+    -framework Foundation -framework FileProvider \
     -o "$TEST_BINARY" \
     "$ROOT/macos/fileprovider/Sources/ShortcutResolver.swift" \
     "$ROOT/macos/fileprovider/Sources/CloudreveClient.swift" \
     "$ROOT/macos/fileprovider/Sources/FileProviderStateDatabase.swift" \
     "$ROOT/macos/fileprovider/Sources/UploadEncryption.swift" \
     "$ROOT/macos/fileprovider/Sources/ObjectStorageUpload.swift" \
+    "$ROOT/macos/fileprovider/Sources/ReplayErrorPolicy.swift" \
+    "$ROOT/macos/fileprovider/Sources/UploadSessionRecord.swift" \
+    "$ROOT/macos/fileprovider/Sources/PartialDownloadStore.swift" \
     "$ROOT/macos/fileprovider/Tests/ShortcutTests.swift"
 
 "$TEST_BINARY"

@@ -384,7 +384,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     progress: progress,
                     onProgress: { processed, total in
                         activity?.update(processedBytes: processed, totalBytes: total)
-                    })
+                    },
+                    resume: (
+                        driveID: store.drive.id, itemIdentifier: itemIdentifier.rawValue,
+                        contentVersion: item.itemVersion.contentVersion
+                    ))
                 if shouldCancelSystemDownload(
                     request: request,
                     itemIdentifier: itemIdentifier,

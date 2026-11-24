@@ -262,6 +262,50 @@ Keep Downloaded state is persisted by stable item identifier. macOS remains in
 charge of eviction and materialization; Cloudreve supplies content when Finder
 requests it and schedules refreshes for remotely modified materialized files.
 
+## Resumable transfers
+
+**Uploads.** After `PUT /file/upload` the extension stores a v1 record in the
+shared state database (namespace `fileprovider-upload-sessions`, key
+`<driveID>:<sessionID>`): session id, URI, size, mtime, SHA-256 of the first and
+last plaintext chunk, chunk size, `nextChunk`, collected ETags, transport kind,
+and the secrets needed to continue (credential, upload URLs, callback secret,
+encryption key/IV). Secrets exist only while the session is live and are never
+logged. The record is flushed after an acknowledged chunk once 8 chunks or 5 s
+have passed, and always before completion. Legacy `{"id","uri"}` rows are version
+0 and are only cleaned up.
+
+The next attempt resumes at `nextChunk` only when the URI, overwrite/previous
+version, size, mtime and both chunk hashes match, the session has not expired
+(60 s margin), the transport is resumable (Upyun is not), and
+`/file/info` reports `sys:upload_session_id` equal to the record's id (a new
+file whose item does not exist yet is not resumed). If the first resumed chunk
+is rejected permanently the session is cancelled and one fresh session starts.
+
+| Failure | Session |
+|---|---|
+| transient (network, 429, 5xx), authentication | kept, `nextChunk` flushed |
+| cancellation while the progress was not cancelled (suspension) | kept |
+| user cancel (`progress.isCancelled`) | cancelled, record deleted |
+| 40073 lock conflict | kept, never cancelled or unlocked |
+| anything else (permanent) | cancelled, record deleted |
+
+Ownership rule: a session is cancelled (`DELETE /file/upload`) only when the
+record exists and `sys:upload_session_id` equals the record's id. Otherwise only
+the record is deleted. At the start of each upload, at most 10 records of the
+drive (oldest first) are examined; expired, version-0 and over-24-hour-old
+records without expiry are discarded under that rule.
+
+**Downloads.** Files of at least 8 MiB stream into
+`<caches>/partial-downloads/<driveID>/<sha256(itemIdentifier)>.part` (the
+extension's own container; `$CLOUDREVE_FP_STATE_ROOT/partial-downloads` in tests)
+with a `.json` sidecar (content version, size, bytes written, encoded flag),
+updated at most every 4 MiB and on error. A partial with the same content version
+and size continues with `Range: bytes=<written>-`; a `200` answer restarts from
+byte 0, a content-encoded response is never resumed. Transient failures keep the
+partial, permanent ones delete it. Partials older than 7 days are evicted, and the
+total is kept at or below 4 GiB (oldest first) whenever a new partial starts.
+Smaller files use the single-shot download path and create no partial files.
+
 ## Identity and anchors
 
 - A File Provider domain is registered per Cloudreve drive.
