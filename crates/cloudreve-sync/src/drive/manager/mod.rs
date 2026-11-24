@@ -740,7 +740,11 @@ impl DriveManager {
             });
             sync_health.push(SyncHealth {
                 drive_id: mount.id.clone(),
-                connected: flags.is_event_push_subscribed() && !flags.is_credential_expired(),
+                connected: crate::drive::push_health::domain_connected(
+                    flags.is_event_push_subscribed(),
+                    flags.is_event_push_degraded(),
+                    flags.is_credential_expired(),
+                ),
                 recovery,
             });
         }
@@ -855,10 +859,12 @@ impl DriveManager {
             let status = if drive_state.is_credential_expired() {
                 DriveInfoStatus::CredentialExpired
             } else {
-                if !drive_state.is_event_push_subscribed() {
-                    DriveInfoStatus::EventPushLost
-                } else {
+                if drive_state.is_event_push_subscribed() {
                     DriveInfoStatus::Active
+                } else if drive_state.is_event_push_degraded() {
+                    DriveInfoStatus::EventPushDegraded
+                } else {
+                    DriveInfoStatus::EventPushLost
                 }
             };
 

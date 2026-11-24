@@ -147,7 +147,12 @@ pub enum ApiError {
 
     /// SSE connection returned non-SSE response (server returned error before upgrading)
     #[error("SSE connection failed (code {code}): {message}")]
-    SseNotUpgraded { code: i32, message: String },
+    SseNotUpgraded {
+        code: i32,
+        message: String,
+        /// HTTP status of the non-SSE response, when known.
+        status: Option<u16>,
+    },
 
     /// SSE stream error
     #[error("SSE stream error: {0}")]

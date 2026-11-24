@@ -138,6 +138,7 @@ pub struct MountStatusFlags(u8);
 impl MountStatusFlags {
     const CREDENTIAL_EXPIRED: u8 = 1 << 0;
     const EVENT_PUSH_SUBSCRIBED: u8 = 1 << 1;
+    const EVENT_PUSH_DEGRADED: u8 = 1 << 2;
 
     /// Create a new MountStatusFlags with all flags cleared
     pub fn new() -> Self {
@@ -172,6 +173,20 @@ impl MountStatusFlags {
         }
     }
 
+    /// Check if live events are known to be unavailable (degraded mode)
+    pub fn is_event_push_degraded(&self) -> bool {
+        self.0 & Self::EVENT_PUSH_DEGRADED != 0
+    }
+
+    /// Set the event push degraded flag
+    pub fn set_event_push_degraded(&mut self, degraded: bool) {
+        if degraded {
+            self.0 |= Self::EVENT_PUSH_DEGRADED;
+        } else {
+            self.0 &= !Self::EVENT_PUSH_DEGRADED;
+        }
+    }
+
     /// Get the raw bits value
     pub fn bits(&self) -> u8 {
         self.0
@@ -195,6 +210,11 @@ pub struct Mount {
     #[cfg(any(target_os = "macos", windows))]
     share_poll_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     remote_event_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Tracks whether the server's live event stream works (degraded mode).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) push_health: Mutex<crate::drive::push_health::PushHealth>,
+    #[cfg(target_os = "macos")]
+    push_fallback_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     #[cfg(target_os = "macos")]
     pub(crate) fileprovider_audit_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     #[cfg(target_os = "macos")]
@@ -326,6 +346,9 @@ impl Mount {
             #[cfg(any(target_os = "macos", windows))]
             share_poll_handle: Arc::new(tokio::sync::Mutex::new(None)),
             remote_event_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            push_health: Mutex::new(crate::drive::push_health::PushHealth::new()),
+            #[cfg(target_os = "macos")]
+            push_fallback_handle: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(target_os = "macos")]
             fileprovider_audit_handle: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(target_os = "macos")]
@@ -446,6 +469,14 @@ impl Mount {
             .lock()
             .await
             .set_event_push_subscribed(subscribed);
+    }
+
+    /// Set the event push degraded flag
+    pub async fn set_event_push_degraded(&self, degraded: bool) {
+        self.status_flags
+            .lock()
+            .await
+            .set_event_push_degraded(degraded);
     }
 
     /// Store the handle for the background initial sync task so it can be
@@ -632,6 +663,14 @@ impl Mount {
     }
 
     pub async fn spawn_remote_event_processor(&self, s: Arc<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let fallback = s.clone();
+            let handle = tokio::spawn(async move {
+                Self::run_push_fallback(fallback).await;
+            });
+            *self.push_fallback_handle.lock().await = Some(handle);
+        }
         let handle = tokio::spawn(async move {
             Self::process_remote_events(s).await;
         });
@@ -818,6 +857,12 @@ impl Mount {
 
     pub async fn shutdown(&self) {
         tracing::info!(target: "drive::mounts", id=%self.id, "Shutting down Mount");
+
+        #[cfg(target_os = "macos")]
+        if let Some(handle) = self.push_fallback_handle.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         // Stop the remote event listener
         if let Some(handle) = self.remote_event_handle.lock().await.take() {
