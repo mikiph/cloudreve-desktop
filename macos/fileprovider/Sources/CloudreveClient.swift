@@ -869,6 +869,11 @@ final class CloudreveClient {
         return port(url) == port(baseURL)
     }
 
+    /// Cloudreve expects `last_modified` in Unix milliseconds (the Windows client sends `as_millis()`).
+    static func lastModifiedMillis(_ date: Date?) -> Int64? {
+        date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded(.down)) }
+    }
+
     /// Uploads the local file to `uri`. When `overwrite` is true, the content
     /// becomes a new version of the existing file at `uri`.
     /// Works for local, relay and remote (slave node) storage policies, which all complete server-side.
@@ -944,7 +949,7 @@ final class CloudreveClient {
             "PUT", "/file/upload",
             body: SessionRequest(
                 uri: wireCloudreveURI(uri), size: size, policy_id: "",
-                last_modified: mtime,
+                last_modified: Self.lastModifiedMillis(attrs[.modificationDate] as? Date),
                 entity_type: overwrite ? "version" : nil,
                 encryption_supported: [UploadEncryptor.supportedAlgorithm],
                 previous: previous))
