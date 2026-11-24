@@ -28,3 +28,7 @@ package/*.exe
 ui/pnpm-lock.yaml
 ui/pnpm-workspace.yaml
 macos/build/
+
+# Advisor plans, test logs and design notes stay local, never in the repo
+/plans/
+/advisor-plans/
