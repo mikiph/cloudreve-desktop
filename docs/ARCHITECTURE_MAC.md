@@ -531,8 +531,11 @@ for both cursor and screen frames. It is then ordered on the clicked display
 with all-Spaces/full-screen auxiliary behavior. No primary-display scaling is
 applied to a secondary monitor.
 
-The macOS extension chunks local, relay and remote (slave node) uploads; other
-storage policies are refused. It sends the account token only to the instance
+The macOS extension chunks local, relay and remote (slave node) uploads. Object
+storage (S3, KS3, COS, OSS, OBS), OneDrive, Qiniu and Upyun policies upload
+directly to the provider via the session's presigned URLs and then the Cloudreve
+callback; Upyun is limited to single-chunk files, and unknown policy types are
+still refused. It sends the account token only to the instance
 origin, and it attempts to cancel the session on an error. Build 193 records its own session IDs and URIs in SQLite before
 uploading chunks. A local deletion cancels matching owned sessions in that
 subtree only after verifying the server still reports the same session ID.
